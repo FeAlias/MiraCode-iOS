@@ -50,6 +50,8 @@ module.exports = {
     'build/',
     'dist/',
     'e2e/',
+    'miracode-web/',
+    'src/screens/MiraCodeScreen/miracodeHtmlBundle.ts',
   ],
   rules: {
     'prettier/prettier': 'error',

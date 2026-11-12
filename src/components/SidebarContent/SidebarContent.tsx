@@ -14,6 +14,7 @@ import {Menu, RenameModal, Checkbox} from '..';
 import {
   BenchmarkIcon,
   ChatIcon,
+  CodeIcon,
   EditIcon,
   ModelIcon,
   PalIcon,
@@ -548,6 +549,13 @@ export const SidebarContent: React.FC<DrawerContentComponentProps> = observer(
       () => (
         <View>
           <Drawer.Section showDivider={false}>
+            <Drawer.Item
+              label="Code Studio"
+              icon={() => <CodeIcon stroke={theme.colors.primary} />}
+              onPress={() => navigateTo(ROUTES.MIRACODE)}
+              style={styles.menuDrawerItem}
+              testID="drawer-item-miracode"
+            />
             <Drawer.Item
               label={l10n.components.sidebarContent.menuItems.chat}
               icon={() => <ChatIcon stroke={theme.colors.primary} />}

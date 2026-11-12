@@ -641,6 +641,7 @@ export type DraftConfig =
   | {mode: 'paired'; resolvedDraftPath: string; draftModel: Model};
 
 export type RootDrawerParamList = {
+  'Code Studio': undefined;
   Chat: undefined;
   Models: undefined;
   Settings: undefined;

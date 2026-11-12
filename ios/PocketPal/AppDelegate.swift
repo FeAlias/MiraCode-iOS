@@ -19,11 +19,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
   ) -> Bool {
     configureGgmlMetal()
 
-    // Initialize Firebase
-    // This is used exclusively for sending model benchmarks (with user consent) to Firebase.
-    // Firebase is used for App Check functionality, allowing unauthenticated users to submit their benchmark data securely.
-    RNFBAppCheckModule.sharedInstance() 
-    FirebaseApp.configure()
+    // Initialize Firebase only when a real GoogleService-Info.plist is provided.
+    // Prevents startup crashes in offline / sideloaded builds using dummy CI config.
+    if let plistPath = Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist"),
+       let options = FirebaseOptions(contentsOfFile: plistPath),
+       !options.googleAppID.contains("000000000000") {
+      RNFBAppCheckModule.sharedInstance()
+      FirebaseApp.configure(options: options)
+    }
 
     let delegate = ReactNativeDelegate()
     let factory = RCTReactNativeFactory(delegate: delegate)

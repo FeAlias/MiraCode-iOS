@@ -1,0 +1,6 @@
+{
+  "name": "AetherCode iOS — Offline Local AI Studio",
+  "description": "Offline-first local AI code generation PWA for iPhone 17 Pro Max with Apple Intelligence, real-time live preview, version history snapshots, and secure GitHub syncing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

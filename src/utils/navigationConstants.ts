@@ -1,6 +1,7 @@
 // Navigation route names
 export const ROUTES = {
   // Main app routes
+  MIRACODE: 'Code Studio',
   CHAT: 'Chat',
   MODELS: 'Models',
   PALS: 'Pals (experimental)',

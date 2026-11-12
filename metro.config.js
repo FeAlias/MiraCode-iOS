@@ -15,6 +15,7 @@ const {assetExts, sourceExts} = defaultConfig.resolver;
 const config = {
   resolver: {
     //nodeModulesPaths: [...localPackagePaths], // update to resolver
+    blockList: [/miracode-web[/\\].*/],
     assetExts: assetExts.filter(ext => ext !== 'svg'),
     sourceExts: [...sourceExts, 'svg'],
   },

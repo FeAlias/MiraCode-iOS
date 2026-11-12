@@ -188,7 +188,7 @@ describe('ModelCard', () => {
       fireEvent.press(getByTestId('load-button'));
     });
     await waitFor(() => {
-      expect(mockNavigate).toHaveBeenCalledWith('Chat');
+      expect(mockNavigate).toHaveBeenCalledWith('Code Studio');
     });
   });
 

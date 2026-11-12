@@ -40,6 +40,7 @@ import {
   ModelType,
   RootDrawerParamList,
 } from '../../../utils/types';
+import {ROUTES} from '../../../utils/navigationConstants';
 import {
   getModelSizeString,
   L10nContext,
@@ -627,7 +628,7 @@ export const ModelCard: React.FC<ModelCardProps> = observer(
           try {
             await modelStore.selectModel(model);
             if (uiStore.autoNavigatetoChat) {
-              navigation.navigate('Chat');
+              navigation.navigate(ROUTES.MIRACODE);
             }
           } catch (e) {
             console.log(`Error: ${e}`);

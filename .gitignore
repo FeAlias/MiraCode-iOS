@@ -112,3 +112,8 @@ android/android-build.log
 # screenshot inventories). Live in the dev-team repo and are sometimes
 # synced into the worktree for local reference; never committed here.
 workflows/
+
+
+# MiraCode web studio build artifacts (preserve miracode-web lockfile)
+miracode-web/dist/
+!miracode-web/package-lock.json

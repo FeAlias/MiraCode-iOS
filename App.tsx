@@ -51,6 +51,7 @@ import {
 } from './src/__automation__';
 import {
   ChatScreen,
+  MiraCodeScreen,
   ModelsScreen,
   SettingsScreen,
   BenchmarkScreen,
@@ -93,7 +94,7 @@ const SwitchPoint: React.FC<SwitchPointProps> = observer(({drawer}) => {
   if (!isHydrated(uiStore)) {
     return null;
   }
-  if (!uiStore.hasCompletedOnboarding) {
+  if (__E2E__ && !uiStore.hasCompletedOnboarding) {
     return <OnboardingStack />;
   }
   return <>{drawer}</>;
@@ -142,6 +143,7 @@ const App = observer(() => {
                     <SwitchPoint
                       drawer={
                         <Drawer.Navigator
+                          initialRouteName={ROUTES.MIRACODE}
                           screenOptions={{
                             headerLeft: () => <HeaderLeft />,
                             drawerStyle: {
@@ -157,6 +159,13 @@ const App = observer(() => {
                           drawerContent={props => (
                             <SidebarContent {...props} />
                           )}>
+                          <Drawer.Screen
+                            name={ROUTES.MIRACODE}
+                            component={gestureHandlerRootHOC(MiraCodeScreen)}
+                            options={{
+                              headerShown: false,
+                            }}
+                          />
                           <Drawer.Screen
                             name={ROUTES.CHAT}
                             component={gestureHandlerRootHOC(ChatScreen)}
