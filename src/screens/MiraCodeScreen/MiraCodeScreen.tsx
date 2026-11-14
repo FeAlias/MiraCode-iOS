@@ -1,5 +1,11 @@
-import React, {useCallback, useEffect, useMemo, useRef} from 'react';
-import {StyleSheet, View} from 'react-native';
+import React, {useCallback, useEffect, useRef, useState} from 'react';
+import {
+  ActivityIndicator,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {DrawerNavigationProp} from '@react-navigation/drawer';
@@ -26,7 +32,7 @@ import {
 import {acquireKeepAwake} from '../../utils/keepAwake';
 import {stopQuietly} from '../../utils/stopQuietly';
 import {ROUTES} from '../../utils/navigationConstants';
-import {MIRACODE_HTML_BASE64} from './miracodeHtmlBundle';
+import {MIRACODE_BUNDLE_HASH, MIRACODE_HTML_BASE64} from './miracodeHtmlBundle';
 
 interface NativeChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -68,7 +74,13 @@ type WebInboundMessage =
   | {type: 'BACKUP_STORAGE'; payload: string}
   | {type: 'REQUEST_RESTORE_STORAGE'; requestId: string};
 
+type StudioWebSource = {uri: string} | {html: string; baseUrl: string};
+
+const INITIAL_SHELL_HTML =
+  '<!doctype html><html style="background:#09090b"><body style="background:#09090b;margin:0"></body></html>';
 const BACKUP_FILE_PATH = `${RNFS.DocumentDirectoryPath}/miracode-workspace-backup.json`;
+const CACHES_DIR_URI = `file://${RNFS.CachesDirectoryPath}`;
+const STUDIO_HTML_PATH = `${RNFS.CachesDirectoryPath}/miracode-studio-${MIRACODE_BUNDLE_HASH}.html`;
 const STREAM_THROTTLE_MS = 45;
 
 export const MiraCodeScreen: React.FC = observer(() => {
@@ -77,13 +89,70 @@ export const MiraCodeScreen: React.FC = observer(() => {
     useNavigation<DrawerNavigationProp<Record<string, object | undefined>>>();
   const webViewRef = useRef<WebView | null>(null);
   const webReadyRef = useRef(false);
+  const [isWebReady, setIsWebReady] = useState(false);
+  const [showBootControls, setShowBootControls] = useState(false);
+  const [webSource, setWebSource] = useState<StudioWebSource>({
+    html: INITIAL_SHELL_HTML,
+    baseUrl: 'about:blank',
+  });
   const totalRamGBRef = useRef(8);
   const activeLeasesRef = useRef<Map<string, GenerationLease>>(new Map());
 
-  const miracodeHtml = useMemo(
-    () => Buffer.from(MIRACODE_HTML_BASE64, 'base64').toString('utf8'),
-    [],
-  );
+  const loadInlineFallback = useCallback(() => {
+    const decodedHtml = Buffer.from(MIRACODE_HTML_BASE64, 'base64').toString(
+      'utf8',
+    );
+    setWebSource({
+      html: decodedHtml,
+      baseUrl: 'https://app.miracode.local/',
+    });
+  }, []);
+
+  // Write the syntax-verified HTML bundle to NVMe cache and load via WKWebView loadFileURL
+  // (avoids bridging multi-MB strings across RN -> WebKit IPC), with automatic inline fallback.
+  useEffect(() => {
+    let cancelled = false;
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    const controlsTimer = setTimeout(() => {
+      if (!cancelled && !webReadyRef.current) {
+        setShowBootControls(true);
+      }
+    }, 1500);
+
+    const prepareLocalBundle = async () => {
+      try {
+        const exists = await Promise.resolve(RNFS.exists(STUDIO_HTML_PATH));
+        if (!exists) {
+          await Promise.resolve(
+            RNFS.writeFile(STUDIO_HTML_PATH, MIRACODE_HTML_BASE64, 'base64'),
+          );
+        }
+        if (cancelled || webReadyRef.current) {
+          return;
+        }
+        setWebSource({uri: `file://${STUDIO_HTML_PATH}`});
+        fallbackTimer = setTimeout(() => {
+          if (!cancelled && !webReadyRef.current) {
+            loadInlineFallback();
+          }
+        }, 2500);
+      } catch {
+        if (!cancelled && !webReadyRef.current) {
+          loadInlineFallback();
+        }
+      }
+    };
+
+    prepareLocalBundle();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(controlsTimer);
+      if (fallbackTimer) {
+        clearTimeout(fallbackTimer);
+      }
+    };
+  }, [loadInlineFallback]);
 
   const sendToWeb = useCallback((msg: Record<string, unknown>) => {
     if (!webViewRef.current) {
@@ -318,6 +387,7 @@ export const MiraCodeScreen: React.FC = observer(() => {
       switch (msg.type) {
         case 'WEB_READY': {
           webReadyRef.current = true;
+          setIsWebReady(true);
           pushStatus();
           break;
         }
@@ -461,7 +531,10 @@ export const MiraCodeScreen: React.FC = observer(() => {
       ]}>
       <WebView
         ref={webViewRef}
-        source={{html: miracodeHtml, baseUrl: 'https://app.miracode.local/'}}
+        source={webSource}
+        allowingReadAccessToURL={CACHES_DIR_URI}
+        allowFileAccess
+        allowUniversalAccessFromFileURLs
         originWhitelist={['*']}
         javaScriptEnabled
         domStorageEnabled
@@ -472,9 +545,38 @@ export const MiraCodeScreen: React.FC = observer(() => {
         scrollEnabled={false}
         overScrollMode="never"
         style={styles.webview}
-        onContentProcessDidTerminate={() => webViewRef.current?.reload()}
+        onError={() => {
+          if (!webReadyRef.current) {
+            loadInlineFallback();
+          }
+        }}
+        onContentProcessDidTerminate={() => {
+          webReadyRef.current = false;
+          setIsWebReady(false);
+          webViewRef.current?.reload();
+        }}
         onMessage={handleWebMessage}
       />
+      {!isWebReady && (
+        <View style={styles.bootOverlay} pointerEvents="box-none">
+          <ActivityIndicator size="small" color="#22d3ee" />
+          <Text style={styles.bootText}>Starting MiraCode Studio...</Text>
+          {showBootControls && (
+            <View style={styles.bootButtonRow}>
+              <TouchableOpacity
+                style={styles.bootButton}
+                onPress={() => navigation.openDrawer()}>
+                <Text style={styles.bootButtonText}>Menu / Models</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.bootButton}
+                onPress={loadInlineFallback}>
+                <Text style={styles.bootButtonText}>Reload Studio</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+        </View>
+      )}
     </View>
   );
 });
@@ -487,5 +589,39 @@ const styles = StyleSheet.create({
   webview: {
     flex: 1,
     backgroundColor: '#09090b',
+  },
+  bootOverlay: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    backgroundColor: '#09090b',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+  },
+  bootText: {
+    color: '#a1a1aa',
+    fontSize: 13,
+    fontWeight: '500',
+  },
+  bootButtonRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 8,
+  },
+  bootButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+    backgroundColor: '#18181b',
+    borderWidth: 1,
+    borderColor: '#27272a',
+  },
+  bootButtonText: {
+    color: '#e4e4e7',
+    fontSize: 12,
+    fontWeight: '600',
   },
 });

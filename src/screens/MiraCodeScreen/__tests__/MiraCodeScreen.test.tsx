@@ -39,10 +39,16 @@ describe('MiraCodeScreen', () => {
     jest.clearAllMocks();
   });
 
-  it('renders the offline WebView studio container', () => {
+  it('renders the offline WebView studio container', async () => {
     const {getByTestId} = render(<MiraCodeScreen />);
     expect(getByTestId('miracode-screen')).toBeTruthy();
-    expect(getByTestId('mock-webview')).toBeTruthy();
+    await waitFor(() => {
+      expect(getByTestId('mock-webview').props.source).toEqual(
+        expect.objectContaining({
+          uri: expect.stringContaining('miracode-studio-'),
+        }),
+      );
+    });
   });
 
   it('pushes NATIVE_STATUS on WEB_READY and handles navigation messages', async () => {
