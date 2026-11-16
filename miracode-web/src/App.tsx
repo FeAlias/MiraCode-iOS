@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { TopBar } from './components/TopBar';
 import { ChatWorkspace, ChatMessage } from './components/ChatWorkspace';
 import { LivePreview, BottomAreaTab } from './components/LivePreview';
@@ -18,6 +18,7 @@ import {
 import { nativeBridge, NativeStatusPayload } from './services/nativeBridge';
 import { offlineStorage, DEFAULT_STARTER_CODE } from './services/storage';
 import { calculateChangeStats } from './services/diffService';
+import { validateCodeSyntax } from './services/previewCompiler';
 import {
   getStoredKnowledgeDocs,
   saveStoredKnowledgeDocs,
@@ -415,6 +416,11 @@ export default function App() {
 
     try {
       const docContext = retrieveRelevantDocContext(prompt, knowledgeDocs, 1400);
+      const currentSyntaxErr = currentCodeSnapshot.trim()
+        ? validateCodeSyntax(currentCodeSnapshot)
+        : null;
+      const activeErrorContext =
+        lastRunError || (currentSyntaxErr ? `Syntax Error: ${currentSyntaxErr}` : null);
 
       const result = await aiEngine.generateCode(
         {
@@ -422,7 +428,7 @@ export default function App() {
           currentCode: currentCodeSnapshot,
           modelId: activeModelId,
           history: nextMessages.map(m => ({ role: m.role, content: m.content })),
-          lastRuntimeError: lastRunError,
+          lastRuntimeError: activeErrorContext,
           docContext,
         },
         statusChunk => {
@@ -514,9 +520,17 @@ export default function App() {
     aiEngine.abortActiveGeneration();
   };
 
+  const liveSyntaxError = useMemo(() => {
+    if (!activeCode.trim()) return null;
+    const err = validateCodeSyntax(activeCode);
+    return err ? `Syntax Error: ${err}` : null;
+  }, [activeCode]);
+
+  const effectiveError = liveSyntaxError || lastRunError;
+
   const handleAskAIToFixError = () => {
-    if (!lastRunError || isGenerating) return;
-    handleSendMessage(`Please fix this error when running the code: ${lastRunError}`);
+    if (!effectiveError || isGenerating) return;
+    handleSendMessage(`Please fix this error when running the code: ${effectiveError}`);
   };
 
   const handleSaveManualCode = async (newCode: string) => {
@@ -706,7 +720,7 @@ export default function App() {
             onUndo={handleUndo}
             onRedo={handleRedo}
             hasPendingChanges={hasPendingChanges}
-            lastRunError={lastRunError}
+            lastRunError={effectiveError}
             onReportRunError={handleReportRunError}
             onAskAIToFixError={handleAskAIToFixError}
             isGenerating={isGenerating}

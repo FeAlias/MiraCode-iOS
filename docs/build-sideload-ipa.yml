@@ -9,7 +9,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-sideload-ipa:
@@ -157,16 +157,47 @@ jobs:
       - name: Verify Metal & llama.rn payload
         run: bash scripts/verify-ios-payload.sh ios/build/Build/Products/Release-iphoneos/PocketPal.app --require-marker
 
-      - name: Package MiraCode-Sideload.ipa with Extended RAM entitlements
+      - name: Package MiraCode-Sideload.ipa & MiraCode-Sideload-IPA.zip with Extended RAM entitlements
         run: |
           bash scripts/package-sideload-ipa.sh \
             ios/build/Build/Products/Release-iphoneos/PocketPal.app \
             ios/PocketPal/PocketPal.entitlements \
             dist/MiraCode-Sideload.ipa
+          (cd dist && zip -9 -q MiraCode-Sideload-IPA.zip MiraCode-Sideload.ipa)
+          ls -lh dist/MiraCode-Sideload.ipa dist/MiraCode-Sideload-IPA.zip
 
-      - name: Upload MiraCode-Sideload.ipa Artifact
+      - name: Upload MiraCode-Sideload-IPA Artifact (.zip on GitHub Actions)
         uses: actions/upload-artifact@v4
         with:
           name: MiraCode-Sideload-IPA
           path: dist/MiraCode-Sideload.ipa
-          retention-days: 30
+          retention-days: 90
+
+      - name: Publish Direct .zip & .ipa Downloads to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="sidestore-latest"
+          NOTES="### Download Straight to iPhone Files / SideStore
+          - **MiraCode-Sideload-IPA.zip** — Zipped archive ready to save directly to iPhone **Files**
+          - **MiraCode-Sideload.ipa** — Direct SideStore `.ipa` (tap **`+`** in SideStore → select file, no unzipping needed)
+
+          Built from commit \`${GITHUB_SHA::8}\` with Extended RAM entitlements and upgraded syntax/patch engine."
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/MiraCode-Sideload-IPA.zip dist/MiraCode-Sideload.ipa --clobber
+            gh release edit "$TAG" --title "MiraCode iOS Sideload (.zip & .ipa)" --notes "$NOTES" --latest
+          else
+            gh release create "$TAG" dist/MiraCode-Sideload-IPA.zip dist/MiraCode-Sideload.ipa \
+              --title "MiraCode iOS Sideload (.zip & .ipa)" \
+              --notes "$NOTES" \
+              --latest
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ### MiraCode iPhone Sideload Build Ready
+          - **Direct .zip Download (iPhone Files):** [MiraCode-Sideload-IPA.zip](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/MiraCode-Sideload-IPA.zip)
+          - **Direct .ipa Download (SideStore):** [MiraCode-Sideload.ipa](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/MiraCode-Sideload.ipa)
+          - **Releases Page:** https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}
+          EOF
+

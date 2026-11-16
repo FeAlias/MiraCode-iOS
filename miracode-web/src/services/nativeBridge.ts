@@ -233,6 +233,11 @@ class NativeBridge {
     this.postToNative({ type: 'UNLOAD_NATIVE_MODEL' });
   }
 
+  setContextWindow(tokens: number) {
+    const clamped = Math.max(2048, Math.min(16384, Math.round(tokens)));
+    this.postToNative({ type: 'SET_CONTEXT_WINDOW', tokens: clamped });
+  }
+
   generateCode(params: {
     messages: NativeChatMessage[];
     maxTokens: number;

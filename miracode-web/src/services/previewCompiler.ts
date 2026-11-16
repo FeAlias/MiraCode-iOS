@@ -126,17 +126,19 @@ function preprocessAndTranspileCode(unwrappedCode: string): {
 
   const usesLucide = iconBindings.length > 0 || /lucide-react/.test(code);
 
-  // 2. Safely strip ESM import statements without greedy cross-file matching
+  const preserveLineBreaks = (matched: string) => matched.replace(/[^\n]/g, ' ');
+
+  // 2. Safely strip ESM import statements while preserving exact 1:1 line numbers for error diagnostics
   code = code
     // Multi-line or single-line named imports: import { a, b } from 'pkg';
     .replace(
       /^\s*import\s+(?:type\s+)?(?:[A-Za-z0-9_$]+\s*,\s*)?(?:\*\s+as\s+[A-Za-z0-9_$]+\s*,\s*)?\{[^;{}]*\}\s*from\s*['"][^'"]+['"]\s*;?/gm,
-      ''
+      preserveLineBreaks
     )
     // Single-line default or namespace imports: import Foo from 'pkg'; / import * as Foo from 'pkg';
-    .replace(/^\s*import\s+[^\n;{}]*?\s+from\s*['"][^'"]+['"]\s*;?/gm, '')
+    .replace(/^\s*import\s+[^\n;{}]*?\s+from\s*['"][^'"]+['"]\s*;?/gm, preserveLineBreaks)
     // Side-effect imports: import './styles.css';
-    .replace(/^\s*import\s*['"][^'"]+['"]\s*;?/gm, '');
+    .replace(/^\s*import\s*['"][^'"]+['"]\s*;?/gm, preserveLineBreaks);
 
   // 3. Detect default export AND fallback PascalCase components (e.g. HelloWorld, Counter, App)
   const candidateComponents: string[] = [];
@@ -747,15 +749,439 @@ export function validateCodeSyntax(rawInputCode: string): string | null {
   }
 }
 
+export interface SyntaxErrorLocation {
+  line: number;
+  column: number;
+  message: string;
+}
+
+export function parseSyntaxErrorLocation(errorText: string | null | undefined): SyntaxErrorLocation | null {
+  if (!errorText) return null;
+  const locMatch = errorText.match(/\((\d+):(\d+)\)/);
+  if (locMatch) {
+    return {
+      line: Math.max(1, parseInt(locMatch[1], 10)),
+      column: Math.max(1, parseInt(locMatch[2], 10)),
+      message: errorText,
+    };
+  }
+  const altMatch = errorText.match(/line\s+(\d+)(?:[:,]\s*col(?:umn)?\s*(\d+))?/i);
+  if (altMatch) {
+    return {
+      line: Math.max(1, parseInt(altMatch[1], 10)),
+      column: altMatch[2] ? Math.max(1, parseInt(altMatch[2], 10)) : 1,
+      message: errorText,
+    };
+  }
+  return null;
+}
+
+const HTML_VOID_ELEMENTS = new Set([
+  'area',
+  'base',
+  'br',
+  'col',
+  'embed',
+  'hr',
+  'img',
+  'input',
+  'link',
+  'meta',
+  'param',
+  'source',
+  'track',
+  'wbr',
+]);
+
+function sanitizeLlmArtifacts(raw: string): string {
+  let cleaned = unwrapMarkdownFence(raw)
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\r\n/g, '\n');
+
+  // Remove accidental stray markdown fences inside extracted code blocks
+  cleaned = cleaned
+    .split('\n')
+    .filter(line => !/^\s*```(?:[a-zA-Z0-9_-]+)?\s*$/.test(line))
+    .join('\n');
+
+  // Normalize curly quotes if code fails syntax due to smart punctuation
+  if (validateCodeSyntax(cleaned) !== null && /[“”‘’]/.test(cleaned)) {
+    const straight = cleaned.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+    if (validateCodeSyntax(straight) === null) {
+      return straight;
+    }
+    cleaned = straight;
+  }
+
+  // Trim trailing LLM prose lines appended after closing </html> or export default statement
+  const lines = cleaned.split('\n');
+  while (lines.length > 3) {
+    const last = lines[lines.length - 1].trim();
+    if (!last) {
+      lines.pop();
+      continue;
+    }
+    const looksLikeTrailingProse =
+      /^(?:Note:|Explanation:|Key changes:|Changes made:|This fixes|Hope this helps|Tap Run)/i.test(
+        last
+      ) ||
+      (/^[A-Z][a-z]+(?:\s+[a-z0-9,'".-]+){4,}[.!]$/.test(last) &&
+        !/[;{}()<>[\]=]/.test(last));
+    if (looksLikeTrailingProse) {
+      lines.pop();
+      continue;
+    }
+    break;
+  }
+
+  return lines.join('\n');
+}
+
+function buildBalancedEofSuffixCandidates(code: string): string[] {
+  type StackItem =
+    | { kind: 'delim'; close: '}' | ')' | ']' }
+    | { kind: 'jsx'; tag: string };
+
+  const stack: StackItem[] = [];
+  let inSingle = false;
+  let inDouble = false;
+  let inTemplate = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+
+  const len = code.length;
+  for (let i = 0; i < len; i++) {
+    const ch = code[i];
+    const next = i + 1 < len ? code[i + 1] : '';
+
+    if (inLineComment) {
+      if (ch === '\n') inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === '*' && next === '/') {
+        inBlockComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (inSingle) {
+      if (ch === '\\') {
+        i++;
+      } else if (ch === "'" || ch === '\n') {
+        inSingle = false;
+      }
+      continue;
+    }
+    if (inDouble) {
+      if (ch === '\\') {
+        i++;
+      } else if (ch === '"' || ch === '\n') {
+        inDouble = false;
+      }
+      continue;
+    }
+    if (inTemplate) {
+      if (ch === '\\') {
+        i++;
+      } else if (ch === '`') {
+        inTemplate = false;
+      }
+      continue;
+    }
+
+    if (ch === '/' && next === '/') {
+      inLineComment = true;
+      i++;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      inBlockComment = true;
+      i++;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      continue;
+    }
+    if (ch === '`') {
+      inTemplate = true;
+      continue;
+    }
+
+    if (ch === '{') {
+      stack.push({ kind: 'delim', close: '}' });
+      continue;
+    }
+    if (ch === '(') {
+      stack.push({ kind: 'delim', close: ')' });
+      continue;
+    }
+    if (ch === '[') {
+      stack.push({ kind: 'delim', close: ']' });
+      continue;
+    }
+    if (ch === '}' || ch === ')' || ch === ']') {
+      for (let s = stack.length - 1; s >= 0; s--) {
+        const item = stack[s];
+        if (item.kind === 'delim' && item.close === ch) {
+          stack.length = s;
+          break;
+        }
+      }
+      continue;
+    }
+
+    // Lightweight JSX open/close tag tracking for truncated React returns
+    if (ch === '<') {
+      const rest = code.slice(i);
+      const closeTagMatch = rest.match(/^<\/\s*([A-Za-z_$][\w$.-]*)\s*>/);
+      if (closeTagMatch) {
+        const closingName = closeTagMatch[1];
+        for (let s = stack.length - 1; s >= 0; s--) {
+          const item = stack[s];
+          if (item.kind === 'jsx' && item.tag === closingName) {
+            stack.length = s;
+            break;
+          }
+        }
+        i += closeTagMatch[0].length - 1;
+        continue;
+      }
+
+      if (rest.startsWith('</>')) {
+        for (let s = stack.length - 1; s >= 0; s--) {
+          const item = stack[s];
+          if (item.kind === 'jsx' && item.tag === '') {
+            stack.length = s;
+            break;
+          }
+        }
+        i += 2;
+        continue;
+      }
+
+      if (rest.startsWith('<>')) {
+        stack.push({ kind: 'jsx', tag: '' });
+        i += 1;
+        continue;
+      }
+
+      const openHead = rest.match(/^<([A-Za-z_$][\w$.-]*)(?=[\s/>])/);
+      if (openHead) {
+        const tagName = openHead[1];
+        // Scan forward to matching '>' outside quotes/braces to detect self-closing '/>'
+        let j = i + openHead[0].length;
+        let braceDepth = 0;
+        let quote: string | null = null;
+        let foundEnd = -1;
+        let selfClosing = false;
+        while (j < len) {
+          const c = code[j];
+          if (quote) {
+            if (c === '\\') {
+              j += 2;
+              continue;
+            }
+            if (c === quote) quote = null;
+            j++;
+            continue;
+          }
+          if (c === '"' || c === "'" || c === '`') {
+            quote = c;
+            j++;
+            continue;
+          }
+          if (c === '{') {
+            braceDepth++;
+            j++;
+            continue;
+          }
+          if (c === '}' && braceDepth > 0) {
+            braceDepth--;
+            j++;
+            continue;
+          }
+          if (c === '>' && braceDepth === 0) {
+            selfClosing = code[j - 1] === '/';
+            foundEnd = j;
+            break;
+          }
+          j++;
+        }
+        if (foundEnd !== -1) {
+          if (!selfClosing && !HTML_VOID_ELEMENTS.has(tagName.toLowerCase())) {
+            stack.push({ kind: 'jsx', tag: tagName });
+          }
+          i = foundEnd;
+          continue;
+        }
+      }
+    }
+  }
+
+  let quoteCloser = '';
+  if (inSingle) quoteCloser = "'";
+  else if (inDouble) quoteCloser = '"';
+  else if (inTemplate) quoteCloser = '`';
+
+  if (!quoteCloser && stack.length === 0) {
+    return [];
+  }
+
+  const closingParts: string[] = [];
+  if (quoteCloser) closingParts.push(quoteCloser);
+  for (let s = stack.length - 1; s >= 0; s--) {
+    const item = stack[s];
+    if (item.kind === 'jsx') {
+      closingParts.push(item.tag ? `</${item.tag}>` : '</>');
+    } else {
+      closingParts.push(item.close);
+    }
+  }
+
+  const joined = closingParts.join('\n');
+  const joinedCompact = closingParts.join('');
+  return [
+    joinedCompact,
+    `\n${joined}`,
+    `${joinedCompact};`,
+    `\n${joined}\nexport default App;`,
+  ];
+}
+
+function trySingleLineExpectedTokenRepair(code: string): string {
+  let current = code;
+
+  for (let pass = 0; pass < 5; pass++) {
+    const err = validateCodeSyntax(current);
+    if (err === null) return current;
+
+    const loc = parseSyntaxErrorLocation(err);
+    if (!loc) break;
+
+    const lines = current.split('\n');
+    const lineIdx = loc.line - 1;
+    if (lineIdx < 0 || lineIdx >= lines.length) break;
+
+    const candidates: string[] = [];
+    const targetLine = lines[lineIdx];
+    const colIdx = Math.max(0, Math.min(targetLine.length, loc.column - 1));
+
+    // Case 1: Sucrase explicitly tells us which punctuation token is missing: expected "," / ";" / ")" / "}" / "]"
+    // Note: inside `fn(arg;` or `[a, b;` or `{ a: 1;`, parsers report `expected ","` when `)`, `]`, or `}` was actually omitted!
+    const expectedTokenMatch = err.match(/expected\s+"([,;:)\]}])"/i);
+    if (expectedTokenMatch) {
+      const primaryTok = expectedTokenMatch[1];
+      const tokensToTry =
+        primaryTok === ',' ? [',', ')', '}', ']', ';'] : [primaryTok, ')', '}', ';'];
+
+      for (const tok of tokensToTry) {
+        const withAtCol = [...lines];
+        withAtCol[lineIdx] =
+          targetLine.slice(0, colIdx) + tok + targetLine.slice(colIdx);
+        candidates.push(withAtCol.join('\n'));
+
+        for (let p = lineIdx - 1; p >= Math.max(0, lineIdx - 2); p--) {
+          const prevTrimmedEnd = lines[p].replace(/\s+$/, '');
+          if (prevTrimmedEnd.length > 0 && !prevTrimmedEnd.endsWith(tok)) {
+            const withPrev = [...lines];
+            withPrev[p] = `${prevTrimmedEnd}${tok}`;
+            candidates.push(withPrev.join('\n'));
+            break;
+          }
+        }
+      }
+    } else if (/Unexpected token/i.test(err)) {
+      for (const tok of [')', '}', ']', ',', ';']) {
+        const withAtCol = [...lines];
+        withAtCol[lineIdx] =
+          targetLine.slice(0, colIdx) + tok + targetLine.slice(colIdx);
+        candidates.push(withAtCol.join('\n'));
+      }
+    }
+
+    // Case 2: Stray extra closing brace/paren on its own line (`}` or `);` or `};`)
+    if (/Unexpected token/i.test(err) && /^\s*[});]+\s*$/.test(targetLine)) {
+      const withoutLine = [...lines.slice(0, lineIdx), ...lines.slice(lineIdx + 1)];
+      candidates.push(withoutLine.join('\n'));
+    }
+
+    // Case 3: Missing closing '>' on an unclosed JSX opening tag at end of previous or current line
+    if (/Unexpected token|Unterminated JSX/i.test(err)) {
+      for (const idx of [lineIdx, lineIdx - 1]) {
+        if (idx >= 0 && idx < lines.length) {
+          const ln = lines[idx].replace(/\s+$/, '');
+          if (/^\s*<[A-Za-z][\w.-]*\b[^>]*["'}]$/.test(ln)) {
+            const withAngle = [...lines];
+            withAngle[idx] = `${ln}>`;
+            candidates.push(withAngle.join('\n'));
+          }
+        }
+      }
+    }
+
+    let improved: string | null = null;
+    for (const cand of candidates) {
+      const nextErr = validateCodeSyntax(cand);
+      if (nextErr === null) {
+        return cand;
+      }
+      const nextLoc = parseSyntaxErrorLocation(nextErr);
+      if (nextLoc && nextLoc.line > loc.line + 1) {
+        improved = cand;
+        break;
+      }
+    }
+
+    if (improved) {
+      current = improved;
+    } else {
+      break;
+    }
+  }
+
+  return current;
+}
+
 /**
- * Attempts instant (<1ms) structural closing-delimiter repair if a small local model
- * stopped right before the final closing tag/parenthesis/brace at EOF.
+ * Deterministic (<5ms) multi-stage offline syntax healer:
+ * 1. Strips LLM markdown/prose artifacts & curly quotes
+ * 2. Applies Sucrase line/column expected-token insertion (`,`, `;`, `)`, `}`, `]`, `>`)
+ * 3. Trims excess trailing braces/parens at EOF
+ * 4. Computes exact unclosed string + JSX tag + delimiter stack to close truncated files
  */
-export function tryRepairTruncatedDelimiters(rawInputCode: string): string {
-  const base = unwrapMarkdownFence(rawInputCode);
+export function healSyntaxErrorsDeterministically(rawInputCode: string): string {
+  const base = sanitizeLlmArtifacts(rawInputCode);
+  if (!base.trim()) return base;
   if (validateCodeSyntax(base) === null) return base;
 
-  const suffixes = [
+  // Stage 1: Line-accurate expected-token repair
+  const lineRepaired = trySingleLineExpectedTokenRepair(base);
+  if (validateCodeSyntax(lineRepaired) === null) {
+    return lineRepaired;
+  }
+
+  // Stage 2: Excess trailing brace / paren trimmer near EOF
+  const lines = lineRepaired.split('\n');
+  for (let trimCount = 1; trimCount <= 3 && lines.length > trimCount + 3; trimCount++) {
+    const tail = lines.slice(lines.length - trimCount);
+    if (tail.every(l => /^\s*[});\s]*$/.test(l))) {
+      const trimmedCandidate = lines.slice(0, lines.length - trimCount).join('\n');
+      if (validateCodeSyntax(trimmedCandidate) === null) {
+        return trimmedCandidate;
+      }
+    }
+  }
+
+  // Stage 3: Lexical JS + JSX stack balancer for truncated outputs
+  const stackSuffixes = buildBalancedEofSuffixCandidates(lineRepaired);
+  const fallbackSuffixes = [
+    ...stackSuffixes,
     '\n}',
     '\n);\n}',
     '\n  );\n}',
@@ -764,12 +1190,24 @@ export function tryRepairTruncatedDelimiters(rawInputCode: string): string {
     '\n};\nexport default App;',
   ];
 
-  for (const suffix of suffixes) {
-    const candidate = base + suffix;
+  for (const suffix of fallbackSuffixes) {
+    if (!suffix) continue;
+    const candidate = lineRepaired + suffix;
     if (validateCodeSyntax(candidate) === null) {
       return candidate;
     }
+    const postHealed = trySingleLineExpectedTokenRepair(candidate);
+    if (validateCodeSyntax(postHealed) === null) {
+      return postHealed;
+    }
   }
 
-  return base;
+  return lineRepaired;
+}
+
+/**
+ * Backward-compatible alias delegating to the full deterministic syntax healer.
+ */
+export function tryRepairTruncatedDelimiters(rawInputCode: string): string {
+  return healSyntaxErrorsDeterministically(rawInputCode);
 }

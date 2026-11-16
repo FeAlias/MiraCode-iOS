@@ -62,6 +62,7 @@ type WebInboundMessage =
   | {type: 'OPEN_MODELS_SCREEN'}
   | {type: 'SELECT_NATIVE_MODEL'; requestId: string; modelId: string}
   | {type: 'UNLOAD_NATIVE_MODEL'}
+  | {type: 'SET_CONTEXT_WINDOW'; tokens: number}
   | {
       type: 'GENERATE_CODE';
       requestId: string;
@@ -241,12 +242,28 @@ export const MiraCodeScreen: React.FC = observer(() => {
     };
   }, []);
 
+  const ensureCodingContextWindow = useCallback(async () => {
+    const minCodingCtx = totalRamGBRef.current >= 6 ? 8192 : 4096;
+    const currentCtx = modelStore.contextInitParams?.n_ctx ?? 2048;
+    if (currentCtx < minCodingCtx) {
+      modelStore.setNContext(minCodingCtx);
+      if (modelStore.activeModel && !modelStore.isContextLoading) {
+        try {
+          await modelStore.selectModel(modelStore.activeModel);
+        } catch {
+          // Keep existing mounted context if remount fails.
+        }
+      }
+    }
+  }, []);
+
   const handleGenerateCode = useCallback(
     async (msg: Extract<WebInboundMessage, {type: 'GENERATE_CODE'}>) => {
       const {requestId, messages, maxTokens, temperature} = msg;
       const releaseKeepAwake = acquireKeepAwake();
       let lease: GenerationLease | null = null;
       try {
+        await ensureCodingContextWindow();
         lease = await modelStore.acquireGeneration();
         if (!lease) {
           sendToWeb({
@@ -274,7 +291,7 @@ export const MiraCodeScreen: React.FC = observer(() => {
           ...defaultCompletionSettings,
           ...toJS(chatSessionStore.newChatCompletionSettings),
           messages,
-          n_predict: Math.min(Math.max(maxTokens || 2048, 256), 4096),
+          n_predict: Math.min(Math.max(maxTokens || 3072, 256), 6144),
           temperature: typeof temperature === 'number' ? temperature : 0.2,
           stop: toJS(modelStore.activeModel?.stopWords) ?? [],
           enable_thinking: false,
@@ -369,7 +386,7 @@ export const MiraCodeScreen: React.FC = observer(() => {
         releaseKeepAwake();
       }
     },
-    [sendToWeb],
+    [ensureCodingContextWindow, sendToWeb],
   );
 
   const handleWebMessage = useCallback(
@@ -411,6 +428,10 @@ export const MiraCodeScreen: React.FC = observer(() => {
             return;
           }
           try {
+            const minCodingCtx = totalRamGBRef.current >= 6 ? 8192 : 4096;
+            if ((modelStore.contextInitParams?.n_ctx ?? 2048) < minCodingCtx) {
+              modelStore.setNContext(minCodingCtx);
+            }
             await modelStore.selectModel(model);
             sendToWeb({
               type: 'SELECT_NATIVE_MODEL_RESULT',
@@ -427,6 +448,23 @@ export const MiraCodeScreen: React.FC = observer(() => {
                   ? error.message
                   : 'Failed to load model into Metal memory.',
             });
+          } finally {
+            pushStatus();
+          }
+          break;
+        }
+        case 'SET_CONTEXT_WINDOW': {
+          const clamped = Math.max(
+            2048,
+            Math.min(16384, Math.round(msg.tokens || 8192)),
+          );
+          try {
+            if (modelStore.contextInitParams?.n_ctx !== clamped) {
+              modelStore.setNContext(clamped);
+              if (modelStore.activeModel && !modelStore.isContextLoading) {
+                await modelStore.selectModel(modelStore.activeModel);
+              }
+            }
           } finally {
             pushStatus();
           }

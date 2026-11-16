@@ -8,7 +8,8 @@ import {
 } from '../types/ai';
 import {
   validateCodeSyntax,
-  tryRepairTruncatedDelimiters,
+  healSyntaxErrorsDeterministically,
+  parseSyntaxErrorLocation,
 } from './previewCompiler';
 import { nativeBridge } from './nativeBridge';
 
@@ -16,14 +17,28 @@ export const DEFAULT_MODEL_ID = 'native_metal_active';
 export const DEFAULT_CONTEXT_WINDOW = 8192;
 export const CONTEXT_WINDOW_OPTIONS = [4096, 6144, 8192, 12288] as const;
 
-const MINIMALIST_SYSTEM_PROMPT = [
+const NEW_PROGRAM_SYSTEM_PROMPT = [
   'You are Qwen Coder, an expert React (TypeScript/JSX), JavaScript, HTML, and Tailwind CSS programmer.',
   'Follow these rules strictly:',
   '1. ALWAYS output ONE complete, runnable code block starting IMMEDIATELY with ```tsx (or ```html / ```js if requested) and ending with ```. Never reply with prose outlines instead of code, and NEVER abbreviate with `// ... existing code` placeholders.',
-  '2. When Current Code is provided, modify it to apply the Latest User Update while keeping ALL existing working features and previous updates intact unless asked to change or remove them.',
+  '2. Ensure every `{`, `(`, `[`, string quote, and JSX `<tag>...</tag>` is properly balanced and closed before ending the block.',
   '3. Always pair explicit contrasting background and text colors (e.g. `bg-zinc-950 text-zinc-100` or `bg-white text-zinc-900`) so text is never invisible.',
   '4. Mobile layout: fit a phone screen cleanly (`min-h-full p-3 flex flex-col items-center`, never clip with `overflow-hidden`). Keep game boards/canvases compact (~220px–260px) so the board, score, and buttons all fit onscreen.',
   '5. Game loops & phone controls: ALWAYS include large on-screen touch buttons (Up, Down, Left, Right, Restart) for games. Inside `setInterval` or `requestAnimationFrame`, read live direction/game state from `useRef` (e.g. `dirRef.current`) instead of stale `useState` closures so touch buttons steer immediately.',
+].join('\n');
+
+const SURGICAL_EDIT_SYSTEM_PROMPT = [
+  'You are Qwen Coder, an expert React (TypeScript/JSX), JavaScript, HTML, and Tailwind CSS debugger and programmer.',
+  'When modifying or fixing Existing Code, follow these rules strictly:',
+  '1. Prefer surgical SEARCH/REPLACE blocks for bug fixes and targeted edits so untouched code stays 100% intact. Use this exact format:',
+  '<<<<<<< SEARCH',
+  '(exact lines from Existing Code to replace — do NOT include line numbers like `42 | `)',
+  '=======',
+  '(new corrected lines)',
+  '>>>>>>> REPLACE',
+  '2. Alternatively, if the change restructures most of the file, output ONE complete, runnable ```tsx code block containing the ENTIRE file from top to bottom with ZERO `// ... existing code` omissions.',
+  '3. NEVER output a partial snippet without `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` markers, and NEVER include line-number prefixes (`12 | `) inside your output code.',
+  '4. Double-check that every `{`, `(`, `[`, comma, semicolon, and JSX `<Tag>...</Tag>` is balanced and valid TypeScript/JSX.',
 ].join('\n');
 
 export const AVAILABLE_MODELS: LocalAIModel[] = [
@@ -60,6 +75,286 @@ export const AVAILABLE_MODELS: LocalAIModel[] = [
   },
 ];
 
+export interface SearchReplacePatch {
+  search: string;
+  replace: string;
+}
+
+function stripAccidentalLineNumbers(block: string): string {
+  const lines = block.split('\n');
+  const nonEmpty = lines.filter(l => l.trim().length > 0);
+  if (nonEmpty.length === 0) return block;
+  const numberedCount = nonEmpty.filter(l => /^\s*>?\s*\d+\s*\|\s?/.test(l)).length;
+  if (numberedCount >= Math.ceil(nonEmpty.length * 0.6)) {
+    return lines.map(l => l.replace(/^\s*>?\s*\d+\s*\|\s?/, '')).join('\n');
+  }
+  return block;
+}
+
+export function parseSearchReplaceBlocks(raw: string): SearchReplacePatch[] {
+  if (!raw) return [];
+  const patches: SearchReplacePatch[] = [];
+  const regex =
+    /<{4,9}\s*SEARCH\b[^\n]*\r?\n([\s\S]*?)\r?\n={4,9}[ \t]*\r?\n([\s\S]*?)\r?\n>{4,9}\s*REPLACE\b/gi;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(raw)) !== null) {
+    const search = stripAccidentalLineNumbers(match[1].replace(/\r\n/g, '\n'));
+    const replace = stripAccidentalLineNumbers(match[2].replace(/\r\n/g, '\n'));
+    if (search.trim().length > 0) {
+      patches.push({ search, replace });
+    }
+  }
+  return patches;
+}
+
+function applySingleSearchReplace(
+  sourceCode: string,
+  searchBlock: string,
+  replaceBlock: string
+): string | null {
+  const src = sourceCode.replace(/\r\n/g, '\n');
+  const search = searchBlock.replace(/\r\n/g, '\n');
+  const replace = replaceBlock.replace(/\r\n/g, '\n');
+
+  // Tier 1: Exact substring match
+  const exactIdx = src.indexOf(search);
+  if (exactIdx !== -1) {
+    return src.slice(0, exactIdx) + replace + src.slice(exactIdx + search.length);
+  }
+
+  const srcLines = src.split('\n');
+  const searchLines = search.split('\n');
+
+  // Trim leading/trailing blank lines on searchLines for line-based matching
+  while (searchLines.length > 0 && searchLines[0].trim() === '') searchLines.shift();
+  while (searchLines.length > 0 && searchLines[searchLines.length - 1].trim() === '') {
+    searchLines.pop();
+  }
+  if (searchLines.length === 0) return null;
+
+  // Tier 2: Line-trimmed match (handles 3B indentation shifts cleanly)
+  for (let i = 0; i <= srcLines.length - searchLines.length; i++) {
+    let matches = true;
+    for (let j = 0; j < searchLines.length; j++) {
+      if (srcLines[i + j].trim() !== searchLines[j].trim()) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      const origIndent = (srcLines[i].match(/^\s*/) || [''])[0];
+      const searchIndent = (searchLines[0].match(/^\s*/) || [''])[0];
+      const replaceLines = replace.split('\n').map(line => {
+        if (!line.trim()) return '';
+        if (searchIndent && line.startsWith(searchIndent)) {
+          return origIndent + line.slice(searchIndent.length);
+        }
+        return line;
+      });
+      return [
+        ...srcLines.slice(0, i),
+        ...replaceLines,
+        ...srcLines.slice(i + searchLines.length),
+      ].join('\n');
+    }
+  }
+
+  // Tier 3: Non-empty whitespace-normalized match (handles extra/missing blank lines)
+  const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
+  const compactSearch = searchLines.map(norm).filter(Boolean);
+  if (compactSearch.length >= 2) {
+    const nonEmptySrc: Array<{ origIdx: number; text: string }> = [];
+    srcLines.forEach((line, idx) => {
+      const n = norm(line);
+      if (n) nonEmptySrc.push({ origIdx: idx, text: n });
+    });
+
+    for (let i = 0; i <= nonEmptySrc.length - compactSearch.length; i++) {
+      let ok = true;
+      for (let j = 0; j < compactSearch.length; j++) {
+        if (nonEmptySrc[i + j].text !== compactSearch[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        const startLine = nonEmptySrc[i].origIdx;
+        const endLine = nonEmptySrc[i + compactSearch.length - 1].origIdx;
+        return [
+          ...srcLines.slice(0, startLine),
+          ...replace.split('\n'),
+          ...srcLines.slice(endLine + 1),
+        ].join('\n');
+      }
+    }
+  }
+
+  return null;
+}
+
+export function applySearchReplacePatches(
+  sourceCode: string,
+  patches: SearchReplacePatch[]
+): { patched: string; appliedCount: number } {
+  let working = sourceCode;
+  let appliedCount = 0;
+  for (const patch of patches) {
+    const next = applySingleSearchReplace(working, patch.search, patch.replace);
+    if (next !== null && next !== working) {
+      working = next;
+      appliedCount++;
+    }
+  }
+  return { patched: working, appliedCount };
+}
+
+function findMatchingBraceEnd(code: string, openBraceIndex: number): number {
+  let depth = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let inTemplate = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+
+  for (let i = openBraceIndex; i < code.length; i++) {
+    const ch = code[i];
+    const next = i + 1 < code.length ? code[i + 1] : '';
+
+    if (inLineComment) {
+      if (ch === '\n') inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === '*' && next === '/') {
+        inBlockComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (inSingle) {
+      if (ch === '\\') i++;
+      else if (ch === "'" || ch === '\n') inSingle = false;
+      continue;
+    }
+    if (inDouble) {
+      if (ch === '\\') i++;
+      else if (ch === '"' || ch === '\n') inDouble = false;
+      continue;
+    }
+    if (inTemplate) {
+      if (ch === '\\') i++;
+      else if (ch === '`') inTemplate = false;
+      continue;
+    }
+
+    if (ch === '/' && next === '/') {
+      inLineComment = true;
+      i++;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      inBlockComment = true;
+      i++;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      continue;
+    }
+    if (ch === '`') {
+      inTemplate = true;
+      continue;
+    }
+
+    if (ch === '{') {
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+/**
+ * If a 3B model outputs only a corrected helper/handler function snippet
+ * (e.g. `const handleMove = (...) => { ... }` or `function resetGame() { ... }`)
+ * instead of the whole 200-line file, splice that named function directly into `sourceCode`!
+ */
+export function trySpliceNamedDeclaration(
+  sourceCode: string,
+  snippetCode: string
+): string | null {
+  const snippet = stripAccidentalLineNumbers(snippetCode).trim();
+  if (!snippet || snippet.length >= sourceCode.length * 0.72) return null;
+
+  // Do not treat a full standalone App component as a partial helper splice
+  if (/\bexport\s+default\b/.test(snippet)) return null;
+
+  const fnDeclMatch = snippet.match(
+    /^(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/
+  );
+  const constFnMatch = snippet.match(
+    /^(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*=>\s*\{/
+  );
+
+  const declName = fnDeclMatch?.[1] || constFnMatch?.[1];
+  if (!declName || declName === 'App') return null;
+
+  const escapedName = declName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const targetRegex = fnDeclMatch
+    ? new RegExp(`([ \\t]*)(?:async\\s+)?function\\s+${escapedName}\\s*\\(`, 'm')
+    : new RegExp(
+        `([ \\t]*)(?:const|let|var)\\s+${escapedName}\\s*(?::[^=]+)?=\\s*(?:async\\s*)?(?:\\([^)]*\\)|[A-Za-z_$][A-Za-z0-9_$]*)\\s*=>\\s*\\{`,
+        'm'
+      );
+
+  const match = targetRegex.exec(sourceCode);
+  if (!match || match.index === undefined) return null;
+
+  const indent = match[1] || '';
+  const openBracePos = sourceCode.indexOf('{', match.index + match[0].length - 1);
+  if (openBracePos === -1) return null;
+
+  const closeBracePos = findMatchingBraceEnd(sourceCode, openBracePos);
+  if (closeBracePos === -1) return null;
+
+  let endPos = closeBracePos + 1;
+  if (sourceCode[endPos] === ';') endPos++;
+
+  const reindentedSnippet = snippet
+    .split('\n')
+    .map((ln, idx) => (idx === 0 ? indent + ln.trimStart() : ln ? indent + ln : ''))
+    .join('\n');
+
+  const spliced =
+    sourceCode.slice(0, match.index) + reindentedSnippet + sourceCode.slice(endPos);
+  const healed = healSyntaxErrorsDeterministically(spliced);
+  return validateCodeSyntax(healed) === null ? healed : null;
+}
+
+function formatNumberedCodeWindow(
+  code: string,
+  focusLine?: number | null,
+  radius = 30
+): string {
+  const lines = code.split('\n');
+  const start = focusLine ? Math.max(1, focusLine - radius) : 1;
+  const end = focusLine ? Math.min(lines.length, focusLine + radius) : lines.length;
+  const out: string[] = [];
+  for (let ln = start; ln <= end; ln++) {
+    const marker = focusLine && ln === focusLine ? '>' : ' ';
+    out.push(`${marker}${String(ln).padStart(4, ' ')} | ${lines[ln - 1]}`);
+  }
+  return out.join('\n');
+}
+
 export class AIEngine {
   private customOllamaUrl = 'http://localhost:11434';
   private preferredContextWindow: number = DEFAULT_CONTEXT_WINDOW;
@@ -77,6 +372,9 @@ export class AIEngine {
   setPreferredContextWindow(tokens: number) {
     const clamped = Math.max(2048, Math.min(16384, Math.round(tokens)));
     this.preferredContextWindow = clamped;
+    if (nativeBridge.isRunningInNativeApp()) {
+      nativeBridge.setContextWindow(clamped);
+    }
   }
 
   getPreferredContextWindow(): number {
@@ -199,6 +497,30 @@ export class AIEngine {
     onProgress?.(100, 'Model mounted.');
   }
 
+  private isBugOrSyntaxFixPrompt(
+    prompt: string,
+    currentCode: string,
+    lastRuntimeError?: string | null
+  ): boolean {
+    if (lastRuntimeError && lastRuntimeError.trim().length > 0) return true;
+    if (currentCode.trim().length > 0 && validateCodeSyntax(currentCode) !== null) {
+      return true;
+    }
+    return /\b(fix|error|bug|syntax|broken|crash|issue|not\s+working|doesn'?t\s+work|missing|unexpected\s+token|unterminated|undefined|null|exception|fail)\b/i.test(
+      prompt
+    );
+  }
+
+  private isPureSyntaxFixOnlyRequest(prompt: string): boolean {
+    const p = prompt.trim();
+    return (
+      /^please\s+fix\s+this\s+error\s+when\s+running\s+the\s+code:\s*Syntax\s*Error/i.test(p) ||
+      /^(?:please\s+)?fix\s+(?:the\s+)?(?:syntax|compile|missing\s+(?:brace|bracket|paren|tag|semicolon|comma))(?:\s+error|\s+errors|\s+issues?)?\.?$/i.test(
+        p
+      )
+    );
+  }
+
   private shouldIncludeCurrentCode(
     prompt: string,
     currentCode: string,
@@ -234,13 +556,6 @@ export class AIEngine {
     return true;
   }
 
-  private clipCodePreservingHeadAndTail(code: string, maxChars: number): string {
-    if (code.length <= maxChars) return code;
-    const headBudget = Math.floor(maxChars * 0.72);
-    const tailBudget = Math.max(400, maxChars - headBudget - 60);
-    return `${code.slice(0, headBudget)}\n/* ... middle section preserved ... */\n${code.slice(-tailBudget)}`;
-  }
-
   private extractRecentUserUpdates(
     request: PromptGenerationRequest,
     maxItems = 5
@@ -264,7 +579,7 @@ export class AIEngine {
   private buildContextualPrompt(
     request: PromptGenerationRequest,
     includeCode: boolean,
-    maxCodeChars = 16000,
+    maxCodeChars = 20000,
     maxDocChars = 2400
   ): string {
     const sections: string[] = [];
@@ -277,73 +592,87 @@ export class AIEngine {
       );
     }
 
-    if (includeCode && request.currentCode.trim().length > 0) {
-      const priorUpdates = this.extractRecentUserUpdates(request, 5);
-      if (priorUpdates.length > 0) {
+    if (!includeCode || request.currentCode.trim().length === 0) {
+      sections.push(
+        `Write the complete runnable code in ONE \`\`\`tsx code block for this request (do not write prose outlines, write the actual code):\n${request.prompt}`
+      );
+      return sections.join('\n\n');
+    }
+
+    const currentSyntaxErr = validateCodeSyntax(request.currentCode);
+    const activeError =
+      request.lastRuntimeError?.trim() ||
+      (currentSyntaxErr ? `Syntax Error: ${currentSyntaxErr}` : '');
+    const errLoc = parseSyntaxErrorLocation(activeError);
+
+    const priorUpdates = this.extractRecentUserUpdates(request, 4);
+    if (priorUpdates.length > 0 && !activeError) {
+      sections.push(
+        `Previous features in Existing Code (keep intact unless asked to change):\n${priorUpdates
+          .map((u, idx) => `${idx + 1}. ${u}`)
+          .join('\n')}`
+      );
+    }
+
+    if (request.currentCode.length <= maxCodeChars) {
+      sections.push(`Existing Code:\n\`\`\`tsx\n${request.currentCode}\n\`\`\``);
+    } else {
+      // Never inject broken `/* ... middle section preserved ... */` inside code!
+      // Instead, show focused region around error (or top/bottom summary) for SEARCH/REPLACE patching.
+      const focusWindow = formatNumberedCodeWindow(
+        request.currentCode,
+        errLoc?.line ?? Math.floor(request.currentCode.split('\n').length / 2),
+        60
+      );
+      sections.push(
+        `Existing Code Window (line-numbered for reference — use SEARCH/REPLACE blocks without line numbers):\n\`\`\`tsx\n${focusWindow}\n\`\`\``
+      );
+    }
+
+    if (activeError) {
+      sections.push(`Active Error to Fix:\n${activeError.slice(0, 600)}`);
+      if (errLoc) {
+        const numberedFocus = formatNumberedCodeWindow(
+          request.currentCode,
+          errLoc.line,
+          14
+        );
         sections.push(
-          `Previous requests already built into Current Code (keep these intact unless asked to change them):\n${priorUpdates
-            .map((u, idx) => `${idx + 1}. ${u}`)
-            .join('\n')}`
+          `Exact Lines Around Error (Line ${errLoc.line}, Column ${errLoc.column}):\n\`\`\`\n${numberedFocus}\n\`\`\``
         );
       }
-
-      const clippedCode = this.clipCodePreservingHeadAndTail(
-        request.currentCode,
-        maxCodeChars
-      );
-      sections.push(`Current Code:\n\`\`\`tsx\n${clippedCode}\n\`\`\``);
-    }
-
-    if (includeCode && request.lastRuntimeError && request.lastRuntimeError.trim().length > 0) {
-      sections.push(
-        `Error when running current code (fix this in the updated code):\n${request.lastRuntimeError
-          .trim()
-          .slice(0, 480)}`
-      );
-    }
-
-    if (sections.length === 0) {
-      return `Write the complete runnable code in a \`\`\`tsx code block for this request (do not write instructions or prose, write the actual code):\n${request.prompt}`;
     }
 
     sections.push(
       [
-        `Latest User Update: ${request.prompt}`,
-        'IMPORTANT: Modify the Current Code above to implement this update while preserving all existing working functionality. Output the ENTIRE updated runnable file inside ONE ```tsx code block (never use `// ... existing code` placeholders and never return the exact same unchanged code).',
+        `User Request: ${request.prompt}`,
+        activeError
+          ? 'Fix the error using ONE or more `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` blocks matching the exact lines in Existing Code (preferred, fastest, safest), OR output the ENTIRE corrected file inside ONE ```tsx code block with zero omissions.'
+          : 'Apply this update using `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` blocks (preferred for targeted edits) OR output the ENTIRE updated file inside ONE ```tsx code block with zero `// ...` omissions.',
       ].join('\n')
     );
+
     return sections.join('\n\n');
   }
 
   private computeMaxTokens(
-    prompt: string,
     includeCurrentCode: boolean,
     contextLimit = DEFAULT_CONTEXT_WINDOW,
     promptCharLength = 400,
     currentCodeLength = 0
   ): number {
-    const estimatedPromptTokens = Math.ceil(
-      (MINIMALIST_SYSTEM_PROMPT.length + promptCharLength) / 2.5
+    const estimatedPromptTokens = Math.ceil((promptCharLength + 700) / 2.8);
+    const availableTokens = Math.max(
+      1024,
+      contextLimit - estimatedPromptTokens - 128
     );
-    const availableTokens = Math.max(512, contextLimit - estimatedPromptTokens - 128);
 
     if (includeCurrentCode && currentCodeLength > 0) {
-      const neededForUpdatedFile = Math.ceil(currentCodeLength / 2.3) + 700;
-      const desiredUpdateTokens = Math.max(2048, neededForUpdatedFile);
-      return Math.min(availableTokens, Math.min(3584, desiredUpdateTokens));
+      const neededForFullFile = Math.ceil(currentCodeLength / 2.4) + 900;
+      return Math.min(availableTokens, Math.min(5600, Math.max(2560, neededForFullFile)));
     }
 
-    const p = prompt.trim();
-    const wordCount = p.split(/\s+/).filter(Boolean).length;
-    const isComplexFeature =
-      /\b(dashboard|calculator|game|tic\s*tac|chess|snake|pong|tetris|flappy|breakout|memory|calendar|kanban|chart|graph|todo|task|timer|stopwatch|form|table|converter|quiz|weather|editor|chat|clock|player)\b/i.test(
-        p
-      );
-
-    const maxDesired = Math.min(3584, contextLimit >= 6144 ? 3072 : 2048);
-    const desired = wordCount <= 10 && !isComplexFeature ? 1024 : maxDesired;
-
-    return Math.min(availableTokens, desired);
+    return Math.min(availableTokens, contextLimit >= 6144 ? 4096 : 2560);
   }
 
   private normalizeCodeForComparison(code: string): string {
@@ -352,41 +681,106 @@ export class AIEngine {
 
   private hasLazyCodeElision(candidate: string, originalCode: string): boolean {
     const hasPlaceholderComment =
-      /\/\/\s*\.\.\.\s*(?:rest|existing|previous|other|unchanged|same|keep|remaining)|\{\/\*\s*\.\.\.\s*(?:rest|existing|previous|other|unchanged|same)/i.test(
+      /\/\/\s*\.\.\.\s*(?:rest|existing|previous|other|unchanged|same|keep|remaining|middle)|\/\*\s*\.\.\.\s*(?:rest|existing|previous|middle)|\{\/\*\s*\.\.\.\s*(?:rest|existing|previous|other|unchanged|same)/i.test(
         candidate
       );
     if (!hasPlaceholderComment) return false;
-    return originalCode.length > 300 && candidate.length < originalCode.length * 0.75;
+    return originalCode.length > 200 && candidate.length < originalCode.length * 0.85;
   }
 
   private looksLikeRunnableCode(text: string): boolean {
     const t = text.trim();
     if (!t) return false;
-    const hasCodeSyntax =
+    return (
       /\b(import\s+React|export\s+default|function\s+[A-Za-z_$]|const\s+[A-Za-z_$[\]{}]|let\s+[A-Za-z_$]|var\s+[A-Za-z_$]|document\.|window\.|console\.log|return\s*\(?[\s\n]*<)/m.test(
         t
       ) ||
       /^\s*(?:<!doctype\s+html|<html\b|<div\b|<main\b|<section\b|<canvas\b|<button\b|<h[1-6]\b|<p\b|<svg\b)/im.test(
         t
-      );
-
-    return hasCodeSyntax;
+      )
+    );
   }
 
-  private hasCompletedFirstCodeBlock(text: string): boolean {
-    const openMatch = text.match(
-      /```(?:tsx|typescript|jsx|javascript|ts|js|html|xml|react)?[ \t]*\r?\n/i
-    );
-    if (!openMatch || openMatch.index === undefined) return false;
+  private looksLikeCompleteStandaloneProgram(
+    candidate: string,
+    originalCode: string
+  ): boolean {
+    const c = candidate.trim();
+    if (!this.looksLikeRunnableCode(c)) return false;
+    if (originalCode.trim().length > 180) {
+      if (this.hasLazyCodeElision(c, originalCode)) return false;
+      // Prevent a 5-line diagnostic snippet from ever masquerading as a full 200-line file replacement!
+      if (c.length < Math.min(180, originalCode.length * 0.45)) {
+        return false;
+      }
+      const origHasDefaultExport = /\bexport\s+default\b|\bfunction\s+App\b/i.test(
+        originalCode
+      );
+      const candHasTopComponent =
+        /\bexport\s+default\b|\bfunction\s+[A-Z][A-Za-z0-9_$]*\s*\(|\bconst\s+[A-Z][A-Za-z0-9_$]*\s*=/m.test(
+          c
+        ) || /^\s*(?:<!doctype\s+html|<html\b)/i.test(c);
+      if (origHasDefaultExport && !candHasTopComponent) {
+        return false;
+      }
+    }
+    return true;
+  }
 
-    const bodyStart = openMatch.index + openMatch[0].length;
-    const afterOpen = text.slice(bodyStart);
+  /**
+   * Only stop generation early when we have a genuinely complete, syntax-valid patch or full file —
+   * NEVER abort right after a tiny 4-line explanation snippet!
+   */
+  private hasCompletedValidOutput(
+    accumulated: string,
+    includeCode: boolean,
+    currentCode: string
+  ): boolean {
+    // Case A: Complete SEARCH/REPLACE block(s) with no unclosed SEARCH marker trailing
+    const openSearchCount = (accumulated.match(/<{4,9}\s*SEARCH\b/gi) || []).length;
+    const closeReplaceCount = (accumulated.match(/>{4,9}\s*REPLACE\b/gi) || []).length;
+    if (
+      includeCode &&
+      currentCode.trim().length > 0 &&
+      openSearchCount > 0 &&
+      openSearchCount === closeReplaceCount &&
+      />\s*REPLACE[ \t]*\r?\n/.test(accumulated)
+    ) {
+      const patches = parseSearchReplaceBlocks(accumulated);
+      if (patches.length > 0) {
+        const { patched, appliedCount } = applySearchReplacePatches(
+          currentCode,
+          patches
+        );
+        if (appliedCount > 0) {
+          const healed = healSyntaxErrorsDeterministically(patched);
+          if (validateCodeSyntax(healed) === null) {
+            return true;
+          }
+        }
+      }
+    }
 
-    const closeMatch = afterOpen.match(/\n```(?:\s*$|\r?\n)/);
-    if (!closeMatch || closeMatch.index === undefined) return false;
+    // Case B: Complete fenced standalone program
+    const fenceRegex =
+      /```(?:tsx|typescript|jsx|javascript|ts|js|html|xml|react)?[ \t]*\r?\n([\s\S]*?)\r?\n```(?:\s*$|\r?\n)/gi;
+    let match: RegExpExecArray | null;
+    while ((match = fenceRegex.exec(accumulated)) !== null) {
+      const body = stripAccidentalLineNumbers((match[1] || '').trim());
+      if (
+        this.looksLikeCompleteStandaloneProgram(
+          body,
+          includeCode ? currentCode : ''
+        )
+      ) {
+        const healed = healSyntaxErrorsDeterministically(body);
+        if (validateCodeSyntax(healed) === null) {
+          return true;
+        }
+      }
+    }
 
-    const codeBody = afterOpen.slice(0, closeMatch.index).trim();
-    return codeBody.length >= 12 && this.looksLikeRunnableCode(codeBody);
+    return false;
   }
 
   private detectRepetitionLoop(text: string): boolean {
@@ -395,28 +789,28 @@ export class AIEngine {
       .map(l => l.trim())
       .filter(l => l.length > 0);
 
-    if (rawLines.length < 12) return false;
+    if (rawLines.length < 16) return false;
 
     let consecutive = 1;
     for (let i = 1; i < rawLines.length; i++) {
-      if (rawLines[i].length >= 20 && rawLines[i] === rawLines[i - 1]) {
+      if (rawLines[i].length >= 24 && rawLines[i] === rawLines[i - 1]) {
         consecutive++;
-        if (consecutive >= 4) return true;
+        if (consecutive >= 6) return true;
       } else {
         consecutive = 1;
       }
     }
 
     const substantive = rawLines.filter(
-      l => l.length >= 16 && !/^(\/\/|\/\*|\*|<\/div>|<\/button>|};|\);|\})$/.test(l)
+      l => l.length >= 20 && !/^(\/\/|\/\*|\*|<\/div>|<\/button>|};|\);|\})$/.test(l)
     );
-    if (substantive.length < 14) return false;
+    if (substantive.length < 20) return false;
 
     const quadCounts = new Map<string, number>();
     for (let i = 0; i <= substantive.length - 4; i++) {
       const quad = `${substantive[i]}\n${substantive[i + 1]}\n${substantive[i + 2]}\n${substantive[i + 3]}`;
       const next = (quadCounts.get(quad) || 0) + 1;
-      if (next >= 3) {
+      if (next >= 4) {
         return true;
       }
       quadCounts.set(quad, next);
@@ -425,7 +819,7 @@ export class AIEngine {
     return false;
   }
 
-  private deduplicateRepeatedLines(code: string): string {
+  private deduplicateRunawayLoops(code: string): string {
     const rawLines = code.split('\n');
     const result: string[] = [];
     let repeatRun = 0;
@@ -433,9 +827,11 @@ export class AIEngine {
 
     for (const line of rawLines) {
       const trimmed = line.trim();
-      if (trimmed.length >= 24 && trimmed === prevTrimmed) {
+      const isStructuralCloser = /^(?:<\/[a-zA-Z0-9_.-]+>|[});\]]+)$/.test(trimmed);
+      if (!isStructuralCloser && trimmed.length >= 28 && trimmed === prevTrimmed) {
         repeatRun++;
-        if (repeatRun >= 2) {
+        // Only strip when an identical long line repeats 5+ times in a row (true token loop)
+        if (repeatRun >= 4) {
           continue;
         }
       } else {
@@ -448,12 +844,147 @@ export class AIEngine {
     return result.join('\n');
   }
 
+  /**
+   * Resolves raw LLM output into updated code by checking:
+   * 1. Surgical `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` patches
+   * 2. Largest complete standalone fenced code block (skipping small diagnostic snippets!)
+   * 3. Named function/declaration splice (`trySpliceNamedDeclaration`) if the model returned only a fixed function
+   */
+  private resolveCandidateCode(
+    rawResponse: string,
+    includeCode: boolean,
+    currentCode: string
+  ): { code: string; usedPatch: boolean } {
+    if (includeCode && currentCode.trim().length > 0) {
+      const patches = parseSearchReplaceBlocks(rawResponse);
+      if (patches.length > 0) {
+        const { patched, appliedCount } = applySearchReplacePatches(
+          currentCode,
+          patches
+        );
+        if (appliedCount > 0) {
+          return {
+            code: healSyntaxErrorsDeterministically(
+              this.deduplicateRunawayLoops(patched)
+            ),
+            usedPatch: true,
+          };
+        }
+      }
+    }
+
+    const blocks = this.extractAllFencedBlocks(rawResponse);
+
+    if (blocks.length > 0) {
+      // Pick the largest complete standalone block first (ignores tiny diagnostic snippets before the full code!)
+      const standaloneBlocks = blocks.filter(b =>
+        this.looksLikeCompleteStandaloneProgram(b, includeCode ? currentCode : '')
+      );
+      if (standaloneBlocks.length > 0) {
+        standaloneBlocks.sort((a, b) => b.length - a.length);
+        return {
+          code: healSyntaxErrorsDeterministically(
+            this.deduplicateRunawayLoops(standaloneBlocks[0])
+          ),
+          usedPatch: false,
+        };
+      }
+
+      // If the model only emitted a partial function/handler snippet while editing existing code, splice it safely!
+      if (includeCode && currentCode.trim().length > 0) {
+        for (const snippet of blocks) {
+          const spliced = trySpliceNamedDeclaration(currentCode, snippet);
+          if (spliced) {
+            return { code: spliced, usedPatch: true };
+          }
+        }
+      }
+
+      // Fallback for brand-new small snippets
+      if (!includeCode || currentCode.trim().length === 0) {
+        const runnable = blocks.filter(b => this.looksLikeRunnableCode(b));
+        if (runnable.length > 0) {
+          runnable.sort((a, b) => b.length - a.length);
+          return {
+            code: healSyntaxErrorsDeterministically(
+              this.deduplicateRunawayLoops(runnable[0])
+            ),
+            usedPatch: false,
+          };
+        }
+      }
+    }
+
+    // Check unclosed fence at EOF (if maxTokens hit before closing ```)
+    const openMatch = rawResponse.match(
+      /```(?:tsx|typescript|jsx|javascript|ts|js|html|xml|react)?[ \t]*\r?\n([\s\S]*)$/i
+    );
+    if (openMatch && openMatch[1]) {
+      const candidate = stripAccidentalLineNumbers(
+        openMatch[1].replace(/```$/, '').trim()
+      );
+      if (
+        !includeCode ||
+        currentCode.trim().length === 0 ||
+        candidate.length >= currentCode.length * 0.5
+      ) {
+        return {
+          code: healSyntaxErrorsDeterministically(
+            this.deduplicateRunawayLoops(candidate)
+          ),
+          usedPatch: false,
+        };
+      }
+    }
+
+    return { code: '', usedPatch: false };
+  }
+
+  private extractAllFencedBlocks(raw: string): string[] {
+    if (!raw) return [];
+    const results: string[] = [];
+    const fenceRegex =
+      /```(?:tsx|typescript|jsx|javascript|ts|js|html|xml|react)?[ \t]*\r?\n([\s\S]*?)```/gi;
+    let match: RegExpExecArray | null;
+    while ((match = fenceRegex.exec(raw)) !== null) {
+      const candidate = stripAccidentalLineNumbers((match[1] || '').trim());
+      if (candidate.length > 0 && !/<{4,9}\s*SEARCH\b/i.test(candidate)) {
+        results.push(candidate);
+      }
+    }
+    return results;
+  }
+
   async generateCode(
     request: PromptGenerationRequest,
     onProgress?: (token: string) => void
   ): Promise<GenerationResult> {
     const startTime = Date.now();
     this.isAbortRequested = false;
+
+    // Instant (<5ms) deterministic syntax heal when user clicks "Fix with AI" on a pure syntax error!
+    if (
+      request.currentCode &&
+      request.currentCode.trim().length > 0 &&
+      validateCodeSyntax(request.currentCode) !== null &&
+      this.isPureSyntaxFixOnlyRequest(request.prompt)
+    ) {
+      const instantHealed = healSyntaxErrorsDeterministically(request.currentCode);
+      if (
+        instantHealed !== request.currentCode &&
+        validateCodeSyntax(instantHealed) === null
+      ) {
+        return {
+          code: instantHealed,
+          explanation:
+            'Fixed the missing/broken syntax automatically and verified clean compilation.',
+          versionTitle: 'Auto-fix syntax error',
+          modelUsed: 'Deterministic Syntax Healer',
+          tokensUsed: 0,
+          durationMs: Math.max(1, Date.now() - startTime),
+        };
+      }
+    }
 
     if (request.modelId === 'ollama_local') {
       return this.generateWithOllama(request, onProgress, startTime);
@@ -489,8 +1020,10 @@ export class AIEngine {
       }
     }
 
-    const effectiveContextWindow =
-      status?.contextWindow || this.preferredContextWindow || DEFAULT_CONTEXT_WINDOW;
+    const effectiveContextWindow = Math.max(
+      status?.contextWindow || 0,
+      this.preferredContextWindow || DEFAULT_CONTEXT_WINDOW
+    );
     const activeModelName = status?.activeModel?.name || 'Apple Metal GGUF';
 
     const includeCode = this.shouldIncludeCurrentCode(
@@ -499,7 +1032,19 @@ export class AIEngine {
       request.lastRuntimeError
     );
 
-    const maxCodeChars = Math.max(12000, Math.floor(effectiveContextWindow * 2.2));
+    const isFixingBug =
+      includeCode &&
+      this.isBugOrSyntaxFixPrompt(
+        request.prompt,
+        request.currentCode,
+        request.lastRuntimeError
+      );
+
+    const systemPrompt = includeCode
+      ? SURGICAL_EDIT_SYSTEM_PROMPT
+      : NEW_PROGRAM_SYSTEM_PROMPT;
+
+    const maxCodeChars = Math.max(18000, Math.floor(effectiveContextWindow * 2.5));
     const maxDocChars = Math.min(3200, Math.floor(effectiveContextWindow * 0.28));
 
     const userMessageContent = this.buildContextualPrompt(
@@ -510,7 +1055,6 @@ export class AIEngine {
     );
 
     const maxTokens = this.computeMaxTokens(
-      request.prompt,
       includeCode,
       effectiveContextWindow,
       userMessageContent.length,
@@ -521,7 +1065,8 @@ export class AIEngine {
       sysPrompt: string,
       usrPrompt: string,
       temperature: number,
-      passMaxTokens = maxTokens
+      passMaxTokens = maxTokens,
+      baseForEarlyStop = includeCode ? request.currentCode : ''
     ): Promise<{ text: string; tokensPredicted?: number; aborted?: boolean }> => {
       let stoppedEarly = false;
       const handle = nativeBridge.generateCode({
@@ -535,7 +1080,11 @@ export class AIEngine {
           onProgress?.(accumulated);
           if (
             !stoppedEarly &&
-            (this.hasCompletedFirstCodeBlock(accumulated) ||
+            (this.hasCompletedValidOutput(
+              accumulated,
+              Boolean(baseForEarlyStop),
+              baseForEarlyStop
+            ) ||
               this.detectRepetitionLoop(accumulated))
           ) {
             stoppedEarly = true;
@@ -545,8 +1094,7 @@ export class AIEngine {
       });
       this.activeAbortFn = handle.abort;
       try {
-        const res = await handle.promise;
-        return res;
+        return await handle.promise;
       } finally {
         if (this.activeAbortFn === handle.abort) {
           this.activeAbortFn = null;
@@ -555,23 +1103,29 @@ export class AIEngine {
     };
 
     const firstPass = await runNativePass(
-      MINIMALIST_SYSTEM_PROMPT,
+      systemPrompt,
       userMessageContent,
-      request.temperature ?? 0.22
+      isFixingBug ? 0.14 : request.temperature ?? 0.2
     );
     let fullResponse = firstPass.text;
-    let totalTokens = firstPass.tokensPredicted;
+    let totalTokens = firstPass.tokensPredicted ?? 0;
 
-    let rawExtracted = this.extractCode(fullResponse);
-    let cleanedCode = this.deduplicateRepeatedLines(rawExtracted);
+    let resolved = this.resolveCandidateCode(
+      fullResponse,
+      includeCode,
+      request.currentCode
+    );
+    let cleanedCode = resolved.code;
 
-    // If the user explicitly pressed Stop, return whatever valid code was streamed (or throw cancel notice)
     if (this.isAbortRequested) {
-      const healed = tryRepairTruncatedDelimiters(cleanedCode);
-      if (healed && this.looksLikeRunnableCode(healed)) {
+      if (
+        cleanedCode &&
+        this.looksLikeRunnableCode(cleanedCode) &&
+        validateCodeSyntax(cleanedCode) === null
+      ) {
         return {
-          code: healed,
-          explanation: 'Generation stopped early. Partial code recovered.',
+          code: cleanedCode,
+          explanation: 'Generation stopped early. Valid code recovered.',
           versionTitle: this.createVersionTitle(request.prompt),
           modelUsed: activeModelName,
           tokensUsed: totalTokens,
@@ -581,150 +1135,202 @@ export class AIEngine {
       throw new Error('Generation stopped.');
     }
 
-    // Safety net 1: force runnable code if model responded with prose
-    if (!this.looksLikeRunnableCode(cleanedCode)) {
-      onProgress?.('Generating runnable code block...');
-      const strictCodePrompt = [
-        `Task: ${request.prompt}`,
-        includeCode && request.currentCode.trim()
-          ? `Existing code to update:\n\`\`\`tsx\n${this.clipCodePreservingHeadAndTail(
-              request.currentCode,
-              maxCodeChars
-            )}\n\`\`\``
-          : '',
-        'IMPORTANT: Do NOT explain or describe what to write. Output ONLY valid, complete React TSX code starting on line 1 with:',
-        '```tsx',
-        "import React, { useState, useEffect, useRef } from 'react';",
-      ]
-        .filter(Boolean)
-        .join('\n\n');
+    // Safety net 1: Model explained the error in prose or wrote an unanchored tiny snippet without applying it
+    if (!cleanedCode || !this.looksLikeRunnableCode(cleanedCode)) {
+      onProgress?.('Applying identified fix directly to code...');
+      const proseDiagnosis = fullResponse.slice(0, 900).trim();
+      const followUpApplyPrompt = includeCode && request.currentCode.trim()
+        ? [
+            `Existing Code:\n\`\`\`tsx\n${request.currentCode.slice(0, maxCodeChars)}\n\`\`\``,
+            proseDiagnosis
+              ? `Your Diagnosis:\n${proseDiagnosis}`
+              : `Task: ${request.prompt}`,
+            'Now apply that exact fix! Output ONLY a `<<<<<<< SEARCH` ... `=======` ... `>>>>>>> REPLACE` patch block matching Existing Code (or the complete updated ```tsx file with zero omissions). Do NOT write prose.',
+          ].join('\n\n')
+        : [
+            `Task: ${request.prompt}`,
+            'Output ONLY valid, complete React TSX code inside ONE ```tsx block starting with:',
+            '```tsx',
+            "import React, { useState, useEffect, useRef } from 'react';",
+          ].join('\n\n');
 
-      const pass2 = await runNativePass(MINIMALIST_SYSTEM_PROMPT, strictCodePrompt, 0.18);
+      const pass2 = await runNativePass(
+        systemPrompt,
+        followUpApplyPrompt,
+        0.14,
+        maxTokens
+      );
       fullResponse = pass2.text;
-      totalTokens = pass2.tokensPredicted ?? totalTokens;
-      rawExtracted = this.extractCode(fullResponse);
-      cleanedCode = this.deduplicateRepeatedLines(rawExtracted);
+      totalTokens += pass2.tokensPredicted ?? 0;
+      resolved = this.resolveCandidateCode(
+        fullResponse,
+        includeCode,
+        request.currentCode
+      );
+      cleanedCode = resolved.code;
     }
 
-    // Safety net 2: prevent lazy elision or unchanged echo on multi-turn edits
+    // Safety net 2: Prevent unchanged echo or lazy `// ... existing code` elision on edits
     if (
       !this.isAbortRequested &&
       includeCode &&
       request.currentCode.trim().length > 0 &&
-      this.looksLikeRunnableCode(cleanedCode)
+      cleanedCode
     ) {
       const isUnchangedEcho =
         this.normalizeCodeForComparison(cleanedCode) ===
         this.normalizeCodeForComparison(request.currentCode);
-      const isLazyElision = this.hasLazyCodeElision(cleanedCode, request.currentCode);
+      const isLazyElision = this.hasLazyCodeElision(
+        cleanedCode,
+        request.currentCode
+      );
 
       if (isUnchangedEcho || isLazyElision) {
-        onProgress?.('Applying requested code changes...');
-        const forceEditPrompt = [
-          `Current Code:\n\`\`\`tsx\n${this.clipCodePreservingHeadAndTail(
-            request.currentCode,
-            maxCodeChars
-          )}\n\`\`\``,
+        onProgress?.('Applying requested code changes surgically...');
+        const forcePatchPrompt = [
+          `Existing Code:\n\`\`\`tsx\n${request.currentCode.slice(0, maxCodeChars)}\n\`\`\``,
           `Required Change: ${request.prompt}`,
           isLazyElision
-            ? 'Your last output omitted existing code with `// ...` comments. Write out the ENTIRE updated file completely with zero omissions inside ONE ```tsx code block.'
-            : 'Your last output returned the exact same code without making the requested change. Modify the code now to implement the Required Change while keeping existing features intact, and return the ENTIRE updated file inside ONE ```tsx code block.',
+            ? 'Your previous output omitted code with `// ...` placeholders. Use `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` blocks for ONLY the lines you are changing so all other lines remain intact!'
+            : 'Your previous output did not change the code. Output a `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` block showing the exact lines in Existing Code to replace and the new lines!',
         ].join('\n\n');
 
-        const retryBudget = this.computeMaxTokens(
-          request.prompt,
-          true,
-          effectiveContextWindow,
-          forceEditPrompt.length,
-          request.currentCode.length
-        );
-
         const retryRes = await runNativePass(
-          MINIMALIST_SYSTEM_PROMPT,
-          forceEditPrompt,
-          0.32,
-          retryBudget
+          SURGICAL_EDIT_SYSTEM_PROMPT,
+          forcePatchPrompt,
+          0.24,
+          maxTokens
         );
-        const retryCandidate = this.deduplicateRepeatedLines(
-          this.extractCode(retryRes.text)
+        totalTokens += retryRes.tokensPredicted ?? 0;
+        const retryResolved = this.resolveCandidateCode(
+          retryRes.text,
+          true,
+          request.currentCode
         );
         if (
-          retryCandidate &&
-          this.looksLikeRunnableCode(retryCandidate) &&
-          !this.hasLazyCodeElision(retryCandidate, request.currentCode)
+          retryResolved.code &&
+          this.looksLikeRunnableCode(retryResolved.code) &&
+          !this.hasLazyCodeElision(retryResolved.code, request.currentCode)
         ) {
-          cleanedCode = retryCandidate;
+          cleanedCode = retryResolved.code;
           fullResponse = retryRes.text;
-          totalTokens = retryRes.tokensPredicted ?? totalTokens;
         }
       }
     }
 
-    // Safety net 3: offline syntax validation + delimiter repair
+    // Safety net 3: Multi-stage offline syntax verification + targeted line-window surgical repair
     if (!this.isAbortRequested && cleanedCode && this.looksLikeRunnableCode(cleanedCode)) {
-      const initialSyntaxErr = validateCodeSyntax(cleanedCode);
-      if (initialSyntaxErr) {
-        const quickHealed = tryRepairTruncatedDelimiters(cleanedCode);
-        if (validateCodeSyntax(quickHealed) === null) {
-          cleanedCode = quickHealed;
-        } else {
-          onProgress?.(`Auto-fixing syntax issue (${initialSyntaxErr.slice(0, 60)})...`);
-          const repairPrompt = [
-            'Fix the syntax error in this code and return the COMPLETE corrected runnable file inside ONE ```tsx code block.',
-            `Compiler Error: ${initialSyntaxErr}`,
-            `Original Request: ${request.prompt}`,
-            `Code to Fix:\n\`\`\`tsx\n${this.clipCodePreservingHeadAndTail(
-              cleanedCode,
-              maxCodeChars
-            )}\n\`\`\``,
-          ].join('\n\n');
+      cleanedCode = healSyntaxErrorsDeterministically(cleanedCode);
 
-          const repairBudget = this.computeMaxTokens(
-            request.prompt,
-            true,
-            effectiveContextWindow,
-            repairPrompt.length,
-            cleanedCode.length
-          );
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const syntaxErr = validateCodeSyntax(cleanedCode);
+        if (syntaxErr === null || this.isAbortRequested) {
+          break;
+        }
 
-          const repairedRes = await runNativePass(
-            MINIMALIST_SYSTEM_PROMPT,
-            repairPrompt,
-            0.15,
-            repairBudget
+        const loc = parseSyntaxErrorLocation(syntaxErr);
+        onProgress?.(
+          `Fixing syntax at ${loc ? `line ${loc.line}` : 'EOF'} (pass ${attempt}/2)...`
+        );
+
+        const brokenLines = cleanedCode.split('\n');
+        const winStart = loc ? Math.max(1, loc.line - 14) : Math.max(1, brokenLines.length - 28);
+        const winEnd = loc
+          ? Math.min(brokenLines.length, loc.line + 14)
+          : brokenLines.length;
+        const rawWindow = brokenLines.slice(winStart - 1, winEnd).join('\n');
+        const numberedWindow = formatNumberedCodeWindow(
+          cleanedCode,
+          loc?.line ?? brokenLines.length,
+          14
+        );
+
+        const surgicalFixPrompt =
+          attempt === 1
+            ? [
+                `Compiler Syntax Error: ${syntaxErr}`,
+                `Numbered Context Around Line ${loc?.line ?? brokenLines.length}:`,
+                `\`\`\`\n${numberedWindow}\n\`\`\``,
+                `Exact Window (lines ${winStart}–${winEnd}) to Fix:`,
+                `\`\`\`tsx\n${rawWindow}\n\`\`\``,
+                'Fix the syntax error in this window! Output ONLY a `<<<<<<< SEARCH` ... `=======` ... `>>>>>>> REPLACE` block (without line numbers) fixing the broken lines.',
+              ].join('\n\n')
+            : [
+                `Fix the syntax error (${syntaxErr}) and output the COMPLETE corrected file inside ONE \`\`\`tsx block with all braces, parentheses, and JSX tags balanced:`,
+                `\`\`\`tsx\n${cleanedCode.slice(0, maxCodeChars)}\n\`\`\``,
+              ].join('\n\n');
+
+        const repairRes = await runNativePass(
+          SURGICAL_EDIT_SYSTEM_PROMPT,
+          surgicalFixPrompt,
+          0.1,
+          attempt === 1 ? 1200 : maxTokens,
+          cleanedCode
+        );
+        totalTokens += repairRes.tokensPredicted ?? 0;
+
+        const repairResolved = this.resolveCandidateCode(
+          repairRes.text,
+          true,
+          cleanedCode
+        );
+        if (repairResolved.code) {
+          const candidateHealed = healSyntaxErrorsDeterministically(
+            repairResolved.code
           );
-          const repairedCandidate = tryRepairTruncatedDelimiters(
-            this.deduplicateRepeatedLines(this.extractCode(repairedRes.text))
-          );
-          if (
-            repairedCandidate &&
-            this.looksLikeRunnableCode(repairedCandidate) &&
-            validateCodeSyntax(repairedCandidate) === null
-          ) {
-            cleanedCode = repairedCandidate;
-            fullResponse = repairedRes.text;
-            totalTokens = repairedRes.tokensPredicted ?? totalTokens;
+          if (validateCodeSyntax(candidateHealed) === null) {
+            cleanedCode = candidateHealed;
+            break;
           }
+          // Also check if model output just the corrected window lines directly inside ```tsx
+          if (attempt === 1) {
+            const blocks = this.extractAllFencedBlocks(repairRes.text);
+            if (blocks.length > 0) {
+              const splicedWindow = [
+                ...brokenLines.slice(0, winStart - 1),
+                blocks[0],
+                ...brokenLines.slice(winEnd),
+              ].join('\n');
+              const healedWindow = healSyntaxErrorsDeterministically(splicedWindow);
+              if (validateCodeSyntax(healedWindow) === null) {
+                cleanedCode = healedWindow;
+                break;
+              }
+            }
+          }
+          cleanedCode = candidateHealed;
         }
       }
     }
-
-    const introNote = this.extractIntroNote(fullResponse);
 
     if (!cleanedCode || !this.looksLikeRunnableCode(cleanedCode)) {
       throw new Error(
-        'The model returned text instead of runnable code. Please try sending your prompt again.'
+        'The model returned commentary instead of code changes. Tap Send or Fix with AI again to apply the code update.'
       );
     }
+
+    const finalSyntaxErr = validateCodeSyntax(cleanedCode);
+    const originalWasValid =
+      includeCode &&
+      request.currentCode.trim().length > 0 &&
+      validateCodeSyntax(request.currentCode) === null;
+
+    if (finalSyntaxErr !== null && originalWasValid) {
+      throw new Error(
+        `Kept your working code safe because the generated edit still had a syntax error (${finalSyntaxErr}). Try rephrasing or splitting the change into a smaller step.`
+      );
+    }
+
+    const introNote = this.extractIntroNote(fullResponse);
 
     return {
       code: cleanedCode,
       explanation:
         introNote ||
-        `Code generated with ${activeModelName}. Tap Run in the middle bar to preview, or view it in the Code tab.`,
+        `Updated with ${activeModelName} (syntax verified). Tap Run to preview or inspect in the Code tab.`,
       versionTitle: this.createVersionTitle(request.prompt),
       modelUsed: activeModelName,
-      tokensUsed: totalTokens ?? Math.floor(fullResponse.length / 4),
+      tokensUsed: totalTokens || Math.floor(fullResponse.length / 4),
       durationMs: Date.now() - startTime,
     };
   }
@@ -739,11 +1345,14 @@ export class AIEngine {
       request.currentCode,
       request.lastRuntimeError
     );
-    const promptBody = `${MINIMALIST_SYSTEM_PROMPT}\n\n${this.buildContextualPrompt(
+    const sysPrompt = includeCode
+      ? SURGICAL_EDIT_SYSTEM_PROMPT
+      : NEW_PROGRAM_SYSTEM_PROMPT;
+    const promptBody = `${sysPrompt}\n\n${this.buildContextualPrompt(
       request,
       includeCode,
-      12000,
-      2000
+      18000,
+      2400
     )}`;
 
     onProgress?.(`Connecting to Ollama at ${this.customOllamaUrl}...`);
@@ -755,9 +1364,14 @@ export class AIEngine {
         model: 'qwen2.5-coder:latest',
         prompt: promptBody,
         options: {
-          temperature: 0.25,
-          repeat_penalty: 1.15,
-          num_predict: this.computeMaxTokens(request.prompt, includeCode),
+          temperature: 0.2,
+          repeat_penalty: 1.12,
+          num_predict: this.computeMaxTokens(
+            includeCode,
+            16384,
+            promptBody.length,
+            request.currentCode.length
+          ),
         },
         stream: false,
       }),
@@ -769,10 +1383,15 @@ export class AIEngine {
 
     const data = await response.json();
     const rawText = String(data.response || '');
-    const code = this.deduplicateRepeatedLines(this.extractCode(rawText));
+    const resolved = this.resolveCandidateCode(
+      rawText,
+      includeCode,
+      request.currentCode
+    );
+    const code = resolved.code || request.currentCode;
 
     return {
-      code: code || request.currentCode,
+      code,
       explanation:
         this.extractIntroNote(rawText) ||
         `Generated via local Ollama node (${this.customOllamaUrl}).`,
@@ -782,33 +1401,13 @@ export class AIEngine {
     };
   }
 
-  private extractCode(raw: string): string {
-    if (!raw) return '';
-    const fenceRegex =
-      /```(?:tsx|typescript|jsx|javascript|ts|js|html|xml|react)?[ \t]*\r?\n([\s\S]*?)```/gi;
-    let match: RegExpExecArray | null;
-    while ((match = fenceRegex.exec(raw)) !== null) {
-      const candidate = (match[1] || '').trim();
-      if (this.looksLikeRunnableCode(candidate)) {
-        return candidate;
-      }
-    }
-
-    const openMatch = raw.match(
-      /```(?:tsx|typescript|jsx|javascript|ts|js|html|xml|react)?[ \t]*\r?\n([\s\S]*)$/i
-    );
-    if (openMatch && openMatch[1]) {
-      return openMatch[1].replace(/```$/, '').trim();
-    }
-
-    return raw.trim();
-  }
-
   private extractIntroNote(raw: string): string {
     if (!raw) return '';
-    const beforeFence = raw.split('```')[0]?.trim() || '';
-    if (beforeFence && beforeFence.length <= 320) {
-      return `${beforeFence}\n\nTap Run to preview or open the Code tab below.`;
+    const beforeBlock = raw
+      .split(/```|<{4,9}\s*SEARCH/i)[0]
+      ?.trim() || '';
+    if (beforeBlock && beforeBlock.length <= 360) {
+      return `${beforeBlock}\n\nSyntax verified — tap Run to preview or open the Code tab.`;
     }
     return '';
   }
