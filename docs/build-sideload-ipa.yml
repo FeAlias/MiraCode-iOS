@@ -178,19 +178,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="sidestore-latest"
-          NOTES="### Download Straight to iPhone Files / SideStore
+          cat > dist/release-notes.md << 'NOTES_EOF'
+          ### Download Straight to iPhone Files / SideStore
           - **MiraCode-Sideload-IPA.zip** — Zipped archive ready to save directly to iPhone **Files**
-          - **MiraCode-Sideload.ipa** — Direct SideStore `.ipa` (tap **`+`** in SideStore → select file, no unzipping needed)
+          - **MiraCode-Sideload.ipa** — Direct SideStore .ipa (tap + in SideStore and select file, no unzipping needed)
 
-          Built from commit \`${GITHUB_SHA::8}\` with Extended RAM entitlements and upgraded syntax/patch engine."
+          Includes Extended RAM entitlements, 8192-token Metal context window, surgical SEARCH/REPLACE code patching, and deterministic syntax auto-healer.
+          NOTES_EOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/MiraCode-Sideload-IPA.zip dist/MiraCode-Sideload.ipa --clobber
-            gh release edit "$TAG" --title "MiraCode iOS Sideload (.zip & .ipa)" --notes "$NOTES" --latest
+            gh release edit "$TAG" --title "MiraCode iOS Sideload (.zip & .ipa)" --notes-file dist/release-notes.md --latest
           else
             gh release create "$TAG" dist/MiraCode-Sideload-IPA.zip dist/MiraCode-Sideload.ipa \
               --title "MiraCode iOS Sideload (.zip & .ipa)" \
-              --notes "$NOTES" \
+              --notes-file dist/release-notes.md \
               --latest
           fi
 
