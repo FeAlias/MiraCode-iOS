@@ -1,3 +1,5 @@
+import { AgentCodingPlan } from './ai';
+
 export interface VersionSnapshot {
   id: string;
   versionNumber: number;
@@ -18,6 +20,7 @@ export interface ProjectChatMessage {
   role: 'user' | 'assistant';
   content: string;
   timestamp: number;
+  kind?: 'chat' | 'plan' | 'build' | 'error';
 }
 
 export interface ProjectFile {
@@ -36,6 +39,7 @@ export interface CodeProject {
   activeCode: string;
   versions: VersionSnapshot[];
   messages?: ProjectChatMessage[];
+  activePlan?: AgentCodingPlan | null;
   files: Record<string, string>;
   githubRepo?: {
     owner: string;

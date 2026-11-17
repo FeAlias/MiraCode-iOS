@@ -62,6 +62,39 @@ export interface KnowledgeDoc {
   createdAt: number;
 }
 
+export type AgentInteractionMode = 'auto' | 'chat' | 'plan' | 'build';
+
+export type PlanStepStatus = 'pending' | 'in_progress' | 'completed' | 'failed';
+
+export interface PlanStepItem {
+  id: string;
+  stepNumber: number;
+  title: string;
+  details: string;
+  status: PlanStepStatus;
+  errorNote?: string;
+}
+
+export interface AgentCodingPlan {
+  id: string;
+  goal: string;
+  summary: string;
+  steps: PlanStepItem[];
+  isNewAppFromScratch?: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PlanStepExecutionContext {
+  goal: string;
+  stepNumber: number;
+  totalSteps: number;
+  stepTitle: string;
+  stepDetails: string;
+  completedStepTitles: string[];
+  forceFreshStart?: boolean;
+}
+
 export interface PromptGenerationRequest {
   prompt: string;
   systemPrompt?: string;
@@ -71,6 +104,7 @@ export interface PromptGenerationRequest {
   temperature?: number;
   lastRuntimeError?: string | null;
   docContext?: string;
+  planStepContext?: PlanStepExecutionContext;
 }
 
 export interface GenerationResult {
@@ -80,4 +114,5 @@ export interface GenerationResult {
   modelUsed: string;
   tokensUsed?: number;
   durationMs: number;
+  selfFixedRuntime?: boolean;
 }

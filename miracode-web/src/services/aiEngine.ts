@@ -5,11 +5,14 @@ import {
   CrashRecoveryInfo,
   WebGPUStatus,
   ShardDownloadStatus,
+  AgentCodingPlan,
+  PlanStepItem,
 } from '../types/ai';
 import {
   validateCodeSyntax,
   healSyntaxErrorsDeterministically,
   parseSyntaxErrorLocation,
+  verifyCodeCompileAndRuntime,
 } from './previewCompiler';
 import { nativeBridge } from './nativeBridge';
 
@@ -40,6 +43,197 @@ const SURGICAL_EDIT_SYSTEM_PROMPT = [
   '3. NEVER output a partial snippet without `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` markers, and NEVER include line-number prefixes (`12 | `) inside your output code.',
   '4. Double-check that every `{`, `(`, `[`, comma, semicolon, and JSX `<Tag>...</Tag>` is balanced and valid TypeScript/JSX.',
 ].join('\n');
+
+const CHAT_REVIEW_SYSTEM_PROMPT = [
+  'You are MiraCode Assistant, a sharp, friendly senior React/TypeScript/HTML pair-programmer.',
+  'The user is chatting with you, asking for a code review, or discussing ideas — do NOT rewrite the whole file.',
+  'Rules:',
+  '1. Answer clearly and concisely in plain English (bullet points welcome).',
+  '2. When reviewing Existing Code, cite specific line numbers, state variables, or functions, and point out concrete bugs, edge cases, or high-impact improvements.',
+  '3. Keep code snippets short (1–8 lines max) and only when illustrating a point.',
+].join('\n');
+
+const PLAN_ARCHITECT_SYSTEM_PROMPT = [
+  'You are MiraCode Architect. Break the coding goal into 3 to 5 small, sequential, runnable implementation steps.',
+  'CRITICAL RULES:',
+  '1. Do NOT write code blocks. Output ONLY a concise architectural plan in this exact format:',
+  'Summary: <1-2 sentence overview of the approach>',
+  'Step 1: <short step title> | <specific, self-contained code changes so the app compiles and runs after Step 1>',
+  'Step 2: <short step title> | <specific, self-contained code changes building on Step 1>',
+  'Step 3: <short step title> | <specific, self-contained code changes building on Step 2>',
+  '2. Keep it between 3 and 5 steps total. Every step MUST leave the app runnable and mobile-friendly (compact layout, contrasting colors, touch controls for games).',
+].join('\n');
+
+export type DetectedAgentIntent =
+  | 'chat'
+  | 'plan'
+  | 'run_next_step'
+  | 'run_all_steps'
+  | 'build';
+
+export function detectAutoAgentIntent(
+  prompt: string,
+  activePlan?: AgentCodingPlan | null
+): DetectedAgentIntent {
+  const p = prompt.trim();
+  const hasPendingPlanSteps = Boolean(
+    activePlan && activePlan.steps.some(s => s.status !== 'completed')
+  );
+
+  if (hasPendingPlanSteps) {
+    if (
+      /^(?:please\s+)?(?:do|run|execute|implement|start|build|continue(?:\s+with)?)\s+(?:the\s+)?(?:next\s+step|step\s*\d+|first\s+step)\b/i.test(
+        p
+      ) ||
+      /^(?:next\s+step|continue\s+plan|go\s+to\s+next\s+step|step\s*\d+)\.?$/i.test(p)
+    ) {
+      return 'run_next_step';
+    }
+    if (
+      /\b(follow\s+(?:the|your|its|this)\s+plan|follow\s+(?:the\s+|your\s+|these\s+)?steps|execute\s+(?:the\s+)?plan|run\s+(?:the\s+)?plan|start\s+(?:the\s+)?plan|build\s+(?:the\s+)?(?:whole\s+|entire\s+)?plan|run\s+all\s+steps|do\s+all\s+steps|complete\s+(?:the\s+)?plan|implement\s+all\s+steps)\b/i.test(
+        p
+      )
+    ) {
+      return 'run_all_steps';
+    }
+  }
+
+  // Explicit request to make / outline a plan first
+  if (
+    /\b(make\s+(?:me\s+)?a\s+plan|create\s+a\s+plan|write\s+a\s+plan|give\s+me\s+a\s+plan|come\s+up\s+with\s+a\s+plan|plan\s+(?:(?:this|it)\s+)?out|plan\s+(?:how\s+to|for)|step[- ]by[- ]step\s+plan|break\s+(?:it|this)\s+(?:down\s+)?into\s+steps|outline\s+(?:a\s+|the\s+)?steps)\b/i.test(
+      p
+    ) &&
+    !/\band\s+(?:then\s+)?(?:write|build|implement)\s+it\s+now\b/i.test(p)
+  ) {
+    return 'plan';
+  }
+
+  // Conversational / Code Review / Question intent (without asking to edit code right now)
+  const asksQuestionOrReview =
+    /\b(what\s+do\s+you\s+think|look\s+over|review\s+(?:my|the|this)\s+code|check\s+(?:my|the|this)\s+code|critique|analyze\s+(?:my|the|this)|explain\b|how\s+does\b|why\s+(?:is|does|did|are|do)\b|what\s+(?:is|are|does)\b|any\s+(?:bugs|issues|problems|suggestions|improvements)|how\s+(?:can|could|should)\s+(?:i|we)\s+(?:improve|make|structure)|brainstorm|thoughts\s+on)\b/i.test(
+      p
+    ) ||
+    (p.endsWith('?') &&
+      !/^(?:can|could|will|would)\s+you\s+(?:please\s+)?(?:write|build|create|make|add|change|update|fix|remove|replace|implement|put|give)\b/i.test(
+        p
+      ));
+
+  const explicitlyDemandsImmediateCodeEdit =
+    /\b(fix\s+it\s+now|apply\s+(?:it|the\s+fix)|update\s+the\s+code\s+now|rewrite\s+it|write\s+the\s+code)\b/i.test(
+      p
+    );
+
+  if (asksQuestionOrReview && !explicitlyDemandsImmediateCodeEdit) {
+    return 'chat';
+  }
+
+  return 'build';
+}
+
+export function parsePlanFromModelOutput(
+  rawText: string,
+  goal: string,
+  isNewAppFromScratch = false
+): AgentCodingPlan {
+  const cleaned = rawText.replace(/```[\s\S]*?```/g, '').trim();
+  const lines = cleaned
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  let summary = '';
+  const parsedSteps: Array<{ title: string; details: string }> = [];
+
+  for (const line of lines) {
+    const cleanLine = line.replace(/^\*+|\*+$/g, '').trim();
+    const summaryMatch = cleanLine.match(/^(?:summary|overview|goal)\s*:\s*(.+)$/i);
+    if (summaryMatch && !summary) {
+      summary = summaryMatch[1].trim();
+      continue;
+    }
+
+    // Match `Step 1: Title | Details`, `Step 1 - Title: Details`, `1. Title — Details`
+    const stepMatch = cleanLine.match(
+      /^(?:[-•#*\s]*(?:step\s*)?(\d+)[.):\-–—]\s*)(.+)$/i
+    );
+    if (stepMatch) {
+      const body = stepMatch[2].replace(/\*\*/g, '').trim();
+      if (!body) continue;
+
+      let title = body;
+      let details = body;
+
+      const pipeIdx = body.indexOf('|');
+      const dashMatch = body.match(/^([^:—–-]{3,52})\s*(?:\||:|—|–|\s-\s)\s*(.+)$/);
+      if (pipeIdx > 2) {
+        title = body.slice(0, pipeIdx).trim();
+        details = body.slice(pipeIdx + 1).trim() || title;
+      } else if (dashMatch) {
+        title = dashMatch[1].trim();
+        details = dashMatch[2].trim();
+      } else if (body.length > 54) {
+        title = `${body.slice(0, 51).trim()}...`;
+        details = body;
+      }
+
+      parsedSteps.push({ title, details });
+    }
+  }
+
+  const finalRawSteps =
+    parsedSteps.length >= 2
+      ? parsedSteps.slice(0, 6)
+      : isNewAppFromScratch
+        ? [
+            {
+              title: 'Core UI layout & state setup',
+              details: `Create the clean mobile layout, contrasting theme, and state hooks for: ${goal}`,
+            },
+            {
+              title: 'Primary interactive logic & handlers',
+              details: `Implement the main interactive mechanics, calculations, or game loop for: ${goal}`,
+            },
+            {
+              title: 'Controls, feedback & edge-case polish',
+              details: 'Add clear touch controls, reset/status indicators, and polish edge cases.',
+            },
+          ]
+        : [
+            {
+              title: 'Prepare state & data structures',
+              details: `Add or update the state hooks and helper types needed for: ${goal}`,
+            },
+            {
+              title: 'Implement core feature logic',
+              details: `Wire up the event handlers and main behavior for: ${goal}`,
+            },
+            {
+              title: 'Integrate UI controls & verify layout',
+              details: 'Connect the new UI elements cleanly while keeping all existing features working.',
+            },
+          ];
+
+  const now = Date.now();
+  const steps: PlanStepItem[] = finalRawSteps.map((s, idx) => ({
+    id: `step_${now}_${idx + 1}`,
+    stepNumber: idx + 1,
+    title: s.title,
+    details: s.details,
+    status: 'pending',
+  }));
+
+  return {
+    id: `plan_${now}`,
+    goal: goal.trim(),
+    summary:
+      summary ||
+      `Step-by-step implementation plan (${steps.length} milestones, verified after each step).`,
+    steps,
+    isNewAppFromScratch,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
 
 export const AVAILABLE_MODELS: LocalAIModel[] = [
   {
@@ -524,10 +718,18 @@ export class AIEngine {
   private shouldIncludeCurrentCode(
     prompt: string,
     currentCode: string,
-    lastRuntimeError?: string | null
+    lastRuntimeError?: string | null,
+    planStepContext?: PromptGenerationRequest['planStepContext']
   ): boolean {
     if (!currentCode || currentCode.trim().length === 0) {
       return false;
+    }
+
+    if (planStepContext) {
+      if (planStepContext.forceFreshStart && planStepContext.stepNumber === 1) {
+        return false;
+      }
+      return true;
     }
 
     if (lastRuntimeError && lastRuntimeError.trim().length > 0) {
@@ -583,6 +785,7 @@ export class AIEngine {
     maxDocChars = 2400
   ): string {
     const sections: string[] = [];
+    const stepCtx = request.planStepContext;
 
     if (request.docContext && request.docContext.trim().length > 0) {
       sections.push(
@@ -593,9 +796,20 @@ export class AIEngine {
     }
 
     if (!includeCode || request.currentCode.trim().length === 0) {
-      sections.push(
-        `Write the complete runnable code in ONE \`\`\`tsx code block for this request (do not write prose outlines, write the actual code):\n${request.prompt}`
-      );
+      if (stepCtx) {
+        sections.push(
+          [
+            `Overall Project Goal: ${stepCtx.goal}`,
+            `Current Milestone — Step ${stepCtx.stepNumber} of ${stepCtx.totalSteps}: ${stepCtx.stepTitle}`,
+            `Step Details: ${stepCtx.stepDetails}`,
+            'Write ONE complete, runnable ```tsx code block implementing ONLY this first milestone cleanly so it compiles and runs immediately. Keep the code modular so subsequent steps can build on it easily.',
+          ].join('\n')
+        );
+      } else {
+        sections.push(
+          `Write the complete runnable code in ONE \`\`\`tsx code block for this request (do not write prose outlines, write the actual code):\n${request.prompt}`
+        );
+      }
       return sections.join('\n\n');
     }
 
@@ -605,20 +819,30 @@ export class AIEngine {
       (currentSyntaxErr ? `Syntax Error: ${currentSyntaxErr}` : '');
     const errLoc = parseSyntaxErrorLocation(activeError);
 
-    const priorUpdates = this.extractRecentUserUpdates(request, 4);
-    if (priorUpdates.length > 0 && !activeError) {
-      sections.push(
-        `Previous features in Existing Code (keep intact unless asked to change):\n${priorUpdates
-          .map((u, idx) => `${idx + 1}. ${u}`)
-          .join('\n')}`
-      );
+    if (stepCtx) {
+      const doneSummary =
+        stepCtx.completedStepTitles.length > 0
+          ? `Completed Milestones (keep working):\n${stepCtx.completedStepTitles
+              .map((t, idx) => `✓ Step ${idx + 1}: ${t}`)
+              .join('\n')}`
+          : '';
+      if (doneSummary) {
+        sections.push(doneSummary);
+      }
+    } else {
+      const priorUpdates = this.extractRecentUserUpdates(request, 4);
+      if (priorUpdates.length > 0 && !activeError) {
+        sections.push(
+          `Previous features in Existing Code (keep intact unless asked to change):\n${priorUpdates
+            .map((u, idx) => `${idx + 1}. ${u}`)
+            .join('\n')}`
+        );
+      }
     }
 
     if (request.currentCode.length <= maxCodeChars) {
       sections.push(`Existing Code:\n\`\`\`tsx\n${request.currentCode}\n\`\`\``);
     } else {
-      // Never inject broken `/* ... middle section preserved ... */` inside code!
-      // Instead, show focused region around error (or top/bottom summary) for SEARCH/REPLACE patching.
       const focusWindow = formatNumberedCodeWindow(
         request.currentCode,
         errLoc?.line ?? Math.floor(request.currentCode.split('\n').length / 2),
@@ -643,14 +867,25 @@ export class AIEngine {
       }
     }
 
-    sections.push(
-      [
-        `User Request: ${request.prompt}`,
-        activeError
-          ? 'Fix the error using ONE or more `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` blocks matching the exact lines in Existing Code (preferred, fastest, safest), OR output the ENTIRE corrected file inside ONE ```tsx code block with zero omissions.'
-          : 'Apply this update using `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` blocks (preferred for targeted edits) OR output the ENTIRE updated file inside ONE ```tsx code block with zero `// ...` omissions.',
-      ].join('\n')
-    );
+    if (stepCtx) {
+      sections.push(
+        [
+          `Overall Project Goal: ${stepCtx.goal}`,
+          `NOW IMPLEMENT ONLY STEP ${stepCtx.stepNumber} OF ${stepCtx.totalSteps}: ${stepCtx.stepTitle}`,
+          `Step Instructions: ${stepCtx.stepDetails}`,
+          'Apply this step using `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` blocks (preferred so existing working code stays untouched) OR output the ENTIRE updated runnable ```tsx file with zero `// ...` omissions. Do NOT break prior steps!',
+        ].join('\n')
+      );
+    } else {
+      sections.push(
+        [
+          `User Request: ${request.prompt}`,
+          activeError
+            ? 'Fix the error using ONE or more `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` blocks matching the exact lines in Existing Code (preferred, fastest, safest), OR output the ENTIRE corrected file inside ONE ```tsx code block with zero omissions.'
+            : 'Apply this update using `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` blocks (preferred for targeted edits) OR output the ENTIRE updated file inside ONE ```tsx code block with zero `// ...` omissions.',
+        ].join('\n')
+      );
+    }
 
     return sections.join('\n\n');
   }
@@ -1029,7 +1264,8 @@ export class AIEngine {
     const includeCode = this.shouldIncludeCurrentCode(
       request.prompt,
       request.currentCode,
-      request.lastRuntimeError
+      request.lastRuntimeError,
+      request.planStepContext
     );
 
     const isFixingBug =
@@ -1321,18 +1557,304 @@ export class AIEngine {
       );
     }
 
+    // Safety net 4: Closed-loop headless runtime verification & automatic self-fix!
+    let selfFixedRuntime = false;
+    if (!this.isAbortRequested && finalSyntaxErr === null) {
+      onProgress?.('Verifying live runtime in sandbox...');
+      const runtimeBootErr = await verifyCodeCompileAndRuntime(cleanedCode);
+      if (runtimeBootErr && !this.isAbortRequested) {
+        onProgress?.(
+          `Self-reviewing runtime issue (${runtimeBootErr.slice(0, 56)}) & patching...`
+        );
+        const numberedCode = formatNumberedCodeWindow(
+          cleanedCode,
+          Math.min(40, Math.ceil(cleanedCode.split('\n').length / 2)),
+          120
+        );
+        const runtimeRepairPrompt = [
+          `Your generated code compiled, but crashed at runtime on mount with this error:\n${runtimeBootErr.slice(0, 600)}`,
+          `Line-Numbered Reference:\n\`\`\`\n${numberedCode.slice(0, 9000)}\n\`\`\``,
+          `Current Code:\n\`\`\`tsx\n${cleanedCode.slice(0, maxCodeChars)}\n\`\`\``,
+          'Fix this runtime crash (e.g. missing variable/icon import, undefined `.map`/property access, or invalid hook call) using a `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` block (without line numbers) or the complete fixed ```tsx file!',
+        ].join('\n\n');
+
+        const rtFixRes = await runNativePass(
+          SURGICAL_EDIT_SYSTEM_PROMPT,
+          runtimeRepairPrompt,
+          0.12,
+          maxTokens,
+          cleanedCode
+        );
+        totalTokens += rtFixRes.tokensPredicted ?? 0;
+
+        const rtResolved = this.resolveCandidateCode(
+          rtFixRes.text,
+          true,
+          cleanedCode
+        );
+        if (rtResolved.code && this.looksLikeRunnableCode(rtResolved.code)) {
+          const rtHealed = healSyntaxErrorsDeterministically(rtResolved.code);
+          if (validateCodeSyntax(rtHealed) === null) {
+            const recheckErr = await verifyCodeCompileAndRuntime(rtHealed);
+            if (recheckErr === null) {
+              cleanedCode = rtHealed;
+              selfFixedRuntime = true;
+            }
+          }
+        }
+      }
+    }
+
     const introNote = this.extractIntroNote(fullResponse);
+    const stepBadge = request.planStepContext
+      ? `Step ${request.planStepContext.stepNumber}/${request.planStepContext.totalSteps} (${request.planStepContext.stepTitle}) complete`
+      : `Updated with ${activeModelName}`;
 
     return {
       code: cleanedCode,
       explanation:
         introNote ||
-        `Updated with ${activeModelName} (syntax verified). Tap Run to preview or inspect in the Code tab.`,
-      versionTitle: this.createVersionTitle(request.prompt),
+        `${stepBadge} · ${
+          selfFixedRuntime
+            ? 'Compile + runtime verified (auto-fixed 1 runtime issue).'
+            : 'Compile + runtime verified.'
+        }`,
+      versionTitle: request.planStepContext
+        ? `Step ${request.planStepContext.stepNumber}: ${this.createVersionTitle(request.planStepContext.stepTitle)}`
+        : this.createVersionTitle(request.prompt),
       modelUsed: activeModelName,
       tokensUsed: totalTokens || Math.floor(fullResponse.length / 4),
       durationMs: Date.now() - startTime,
+      selfFixedRuntime,
     };
+  }
+
+  /**
+   * Conversational Pair-Programmer & Code Reviewer (`Chat` mode):
+   * Reads the user's code with line numbers, answers questions, reviews architecture/bugs,
+   * and discusses ideas naturally WITHOUT overwriting `activeCode`.
+   */
+  async chatWithCode(
+    params: {
+      prompt: string;
+      currentCode: string;
+      modelId: string;
+      history?: { role: 'user' | 'assistant'; content: string }[];
+      lastRuntimeError?: string | null;
+      docContext?: string;
+    },
+    onProgress?: (streamText: string) => void
+  ): Promise<{ reply: string; modelUsed: string }> {
+    this.isAbortRequested = false;
+
+    const sections: string[] = [];
+    if (params.docContext?.trim()) {
+      sections.push(`Reference Docs:\n${params.docContext.trim().slice(0, 2000)}`);
+    }
+    if (params.currentCode?.trim()) {
+      const numbered = formatNumberedCodeWindow(
+        params.currentCode,
+        Math.ceil(params.currentCode.split('\n').length / 2),
+        220
+      );
+      sections.push(`Current Code in Editor (line-numbered):\n\`\`\`tsx\n${numbered.slice(0, 15000)}\n\`\`\``);
+    } else {
+      sections.push('(Editor is currently empty — no code written yet.)');
+    }
+    if (params.lastRuntimeError?.trim()) {
+      sections.push(`Active Error in Preview:\n${params.lastRuntimeError.trim().slice(0, 500)}`);
+    }
+    if (params.history && params.history.length > 1) {
+      const recentTurns = params.history
+        .slice(-6, -1)
+        .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 320)}`)
+        .join('\n');
+      if (recentTurns) {
+        sections.push(`Recent Conversation:\n${recentTurns}`);
+      }
+    }
+    sections.push(`User Question / Review Request:\n${params.prompt}`);
+    const userContent = sections.join('\n\n');
+
+    if (params.modelId === 'ollama_local') {
+      const res = await fetch(`${this.customOllamaUrl}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'qwen2.5-coder:latest',
+          prompt: `${CHAT_REVIEW_SYSTEM_PROMPT}\n\n${userContent}`,
+          options: { temperature: 0.3, num_predict: 1024 },
+          stream: false,
+        }),
+      });
+      if (!res.ok) throw new Error(`Ollama returned HTTP ${res.status}`);
+      const data = await res.json();
+      return {
+        reply: String(data.response || '').trim() || 'No response returned.',
+        modelUsed: 'Ollama Local Node',
+      };
+    }
+
+    const activeModelName = await this.ensureNativeMetalReady(onProgress);
+    const handle = nativeBridge.generateCode({
+      messages: [
+        { role: 'system', content: CHAT_REVIEW_SYSTEM_PROMPT },
+        { role: 'user', content: userContent },
+      ],
+      maxTokens: 1100,
+      temperature: 0.3,
+      onProgress: acc => {
+        onProgress?.(acc);
+        if (this.detectRepetitionLoop(acc)) {
+          handle.abort();
+        }
+      },
+    });
+    this.activeAbortFn = handle.abort;
+    try {
+      const out = await handle.promise;
+      return {
+        reply: out.text.trim() || 'Ready — ask anything about your code or tap Plan to map out next steps.',
+        modelUsed: activeModelName,
+      };
+    } finally {
+      if (this.activeAbortFn === handle.abort) {
+        this.activeAbortFn = null;
+      }
+    }
+  }
+
+  /**
+   * Architectural Step-by-Step Planner (`Plan` mode):
+   * Inspects `currentCode` + conversation context and creates a structured 3–5 step
+   * `AgentCodingPlan` checklist without modifying `activeCode` until the user runs steps.
+   */
+  async generateCodingPlan(
+    params: {
+      prompt: string;
+      currentCode: string;
+      isStarterOrBlankCode: boolean;
+      modelId: string;
+      history?: { role: 'user' | 'assistant'; content: string }[];
+      lastRuntimeError?: string | null;
+      docContext?: string;
+    },
+    onProgress?: (streamText: string) => void
+  ): Promise<{ plan: AgentCodingPlan; modelUsed: string }> {
+    this.isAbortRequested = false;
+
+    const sections: string[] = [];
+    if (params.docContext?.trim()) {
+      sections.push(`Reference Docs:\n${params.docContext.trim().slice(0, 1600)}`);
+    }
+
+    if (!params.isStarterOrBlankCode && params.currentCode.trim().length > 0) {
+      sections.push(
+        `Existing Working Code (${params.currentCode.split('\n').length} lines — plan incremental steps on top of this code):\n\`\`\`tsx\n${params.currentCode.slice(0, 14000)}\n\`\`\``
+      );
+    } else {
+      sections.push('(Starting a brand-new program from scratch.)');
+    }
+
+    if (params.lastRuntimeError?.trim()) {
+      sections.push(`Current Error to Address in Plan:\n${params.lastRuntimeError.trim().slice(0, 400)}`);
+    }
+
+    if (params.history && params.history.length > 1) {
+      const recentChat = params.history
+        .slice(-5, -1)
+        .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 380)}`)
+        .join('\n');
+      if (recentChat) {
+        sections.push(`Recent Discussion Context:\n${recentChat}`);
+      }
+    }
+
+    sections.push(
+      [
+        `Goal to Plan: ${params.prompt}`,
+        'Remember: Output ONLY `Summary: ...` followed by 3 to 5 `Step N: <title> | <details>` lines. Do NOT output code blocks yet.',
+      ].join('\n')
+    );
+
+    const userContent = sections.join('\n\n');
+
+    if (params.modelId === 'ollama_local') {
+      const res = await fetch(`${this.customOllamaUrl}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'qwen2.5-coder:latest',
+          prompt: `${PLAN_ARCHITECT_SYSTEM_PROMPT}\n\n${userContent}`,
+          options: { temperature: 0.22, num_predict: 700 },
+          stream: false,
+        }),
+      });
+      if (!res.ok) throw new Error(`Ollama returned HTTP ${res.status}`);
+      const data = await res.json();
+      const raw = String(data.response || '');
+      return {
+        plan: parsePlanFromModelOutput(raw, params.prompt, params.isStarterOrBlankCode),
+        modelUsed: 'Ollama Local Node',
+      };
+    }
+
+    const activeModelName = await this.ensureNativeMetalReady(onProgress);
+    const handle = nativeBridge.generateCode({
+      messages: [
+        { role: 'system', content: PLAN_ARCHITECT_SYSTEM_PROMPT },
+        { role: 'user', content: userContent },
+      ],
+      maxTokens: 700,
+      temperature: 0.22,
+      onProgress: acc => {
+        onProgress?.(acc);
+        if (this.detectRepetitionLoop(acc)) {
+          handle.abort();
+        }
+      },
+    });
+    this.activeAbortFn = handle.abort;
+    try {
+      const out = await handle.promise;
+      const plan = parsePlanFromModelOutput(
+        out.text,
+        params.prompt,
+        params.isStarterOrBlankCode
+      );
+      return { plan, modelUsed: activeModelName };
+    } finally {
+      if (this.activeAbortFn === handle.abort) {
+        this.activeAbortFn = null;
+      }
+    }
+  }
+
+  private async ensureNativeMetalReady(
+    onProgress?: (statusText: string) => void
+  ): Promise<string> {
+    if (!nativeBridge.isRunningInNativeApp()) {
+      throw new Error(
+        'Native Metal engine is unavailable in a plain browser. Open MiraCode inside the iOS app or select Local Ollama in Settings.'
+      );
+    }
+
+    let status = nativeBridge.getLatestStatus();
+    if (!status?.activeModel?.isLoaded) {
+      const downloaded = status?.downloadedModels || [];
+      if (downloaded.length > 0) {
+        const preferred =
+          downloaded.find(m => /coder/i.test(m.name)) || downloaded[0];
+        onProgress?.(`Mounting ${preferred.name} into Apple Metal GPU...`);
+        await nativeBridge.selectNativeModel(preferred.id);
+        status = nativeBridge.getLatestStatus();
+      } else {
+        throw new Error(
+          'No GGUF model loaded yet. Tap the Models button above (or Settings) to download Qwen 2.5 Coder 3B or 7B.'
+        );
+      }
+    }
+    return status?.activeModel?.name || 'Apple Metal GGUF';
   }
 
   private async generateWithOllama(
@@ -1343,7 +1865,8 @@ export class AIEngine {
     const includeCode = this.shouldIncludeCurrentCode(
       request.prompt,
       request.currentCode,
-      request.lastRuntimeError
+      request.lastRuntimeError,
+      request.planStepContext
     );
     const sysPrompt = includeCode
       ? SURGICAL_EDIT_SYSTEM_PROMPT

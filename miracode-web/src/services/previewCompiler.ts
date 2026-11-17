@@ -215,17 +215,21 @@ function escapeInlineScript(js: string): string {
   return js.replace(/<\/script>/gi, '<\\/script>');
 }
 
-function buildErrorBridgeScript(): string {
+function buildErrorBridgeScript(probeId?: string): string {
+  const errType = probeId ? 'AETHER_PROBE_ERROR' : 'AETHER_PREVIEW_ERROR';
+  const okType = probeId ? 'AETHER_PROBE_SUCCESS' : 'AETHER_PREVIEW_SUCCESS';
+  const probeField = probeId ? `, probeId: ${JSON.stringify(probeId)}` : '';
+
   return `
     window.__aetherReportError = function (title, detail) {
       var full = (title ? title + ': ' : '') + String(detail || 'Unknown error');
       try {
-        window.parent.postMessage({ type: 'AETHER_PREVIEW_ERROR', error: full }, '*');
+        window.parent.postMessage({ type: '${errType}', error: full${probeField} }, '*');
       } catch (e) {}
     };
     window.__aetherReportSuccess = function () {
       try {
-        window.parent.postMessage({ type: 'AETHER_PREVIEW_SUCCESS' }, '*');
+        window.parent.postMessage({ type: '${okType}'${probeField} }, '*');
       } catch (e) {}
     };
     window.addEventListener('error', function (ev) {
@@ -240,7 +244,10 @@ function buildErrorBridgeScript(): string {
   `;
 }
 
-export async function compilePreviewBundle(rawInputCode: string): Promise<CompilationResult> {
+export async function compilePreviewBundle(
+  rawInputCode: string,
+  probeId?: string
+): Promise<CompilationResult> {
   const code = unwrapMarkdownFence(rawInputCode);
 
   let compiledCSS = '';
@@ -254,7 +261,7 @@ export async function compilePreviewBundle(rawInputCode: string): Promise<Compil
 
   // Mode A: Full HTML Document (<!DOCTYPE html> / <html>) or HTML + <canvas>/<script> Snippet
   if (isFullHtmlDocument(code) || isHtmlWithScriptSnippet(code)) {
-    const bridgeTag = `<style>${compiledCSS}\n${LIGHT_BG_CONTRAST_CSS}</style><script>${buildErrorBridgeScript()}window.addEventListener('load', function(){ window.__aetherReportSuccess(); });</script>`;
+    const bridgeTag = `<style>${compiledCSS}\n${LIGHT_BG_CONTRAST_CSS}</style><script>${buildErrorBridgeScript(probeId)}window.addEventListener('load', function(){ window.__aetherReportSuccess(); });</script>`;
     if (isFullHtmlDocument(code)) {
       const injectedHtml = /<\/head>/i.test(code)
         ? code.replace(/<\/head>/i, `${bridgeTag}</head>`)
@@ -285,7 +292,7 @@ export async function compilePreviewBundle(rawInputCode: string): Promise<Compil
       overflow-y: auto;
     }
   </style>
-  <script>${buildErrorBridgeScript()}</script>
+  <script>${buildErrorBridgeScript(probeId)}</script>
 </head>
 <body class="bg-zinc-950 text-zinc-100 min-h-screen antialiased">
   ${code}
@@ -320,7 +327,7 @@ export async function compilePreviewBundle(rawInputCode: string): Promise<Compil
       overflow-y: auto;
     }
   </style>
-  <script>${buildErrorBridgeScript()}</script>
+  <script>${buildErrorBridgeScript(probeId)}</script>
 </head>
 <body class="bg-zinc-950 text-zinc-100 antialiased">
   <div id="root">${code}</div>
@@ -357,6 +364,8 @@ export async function compilePreviewBundle(rawInputCode: string): Promise<Compil
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;');
     const escapedForPost = JSON.stringify(`Syntax Error: ${compileError}`);
+    const errMsgType = probeId ? 'AETHER_PROBE_ERROR' : 'AETHER_PREVIEW_ERROR';
+    const probeField = probeId ? `, probeId: ${JSON.stringify(probeId)}` : '';
     const html = `<!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
@@ -373,7 +382,7 @@ export async function compilePreviewBundle(rawInputCode: string): Promise<Compil
   </div>
   <script>
     try {
-      window.parent.postMessage({ type: 'AETHER_PREVIEW_ERROR', error: ${escapedForPost} }, '*');
+      window.parent.postMessage({ type: '${errMsgType}', error: ${escapedForPost}${probeField} }, '*');
     } catch (e) {}
   </script>
 </body>
@@ -422,7 +431,7 @@ export async function compilePreviewBundle(rawInputCode: string): Promise<Compil
 
   <script>
     (function () {
-      ${buildErrorBridgeScript()}
+      ${buildErrorBridgeScript(probeId)}
 
       const consoleLogs = [];
       const originalConsole = {
@@ -1210,4 +1219,92 @@ export function healSyntaxErrorsDeterministically(rawInputCode: string): string 
  */
 export function tryRepairTruncatedDelimiters(rawInputCode: string): string {
   return healSyntaxErrorsDeterministically(rawInputCode);
+}
+
+/**
+ * Closed-loop compile + headless runtime verification:
+ * 1. Synchronously checks TypeScript/JSX syntax via Sucrase.
+ * 2. Mounts the compiled bundle inside a hidden 1x1 offscreen sandbox iframe for ~280ms
+ *    to catch immediate runtime crashes (`ReferenceError`, `TypeError`, undefined icons/hooks,
+ *    infinite render loops, or `Nothing Rendered Yet`) BEFORE marking a build step complete!
+ * Returns `null` if both compile and runtime boot succeed, or the exact error message string.
+ */
+export async function verifyCodeCompileAndRuntime(
+  rawInputCode: string,
+  settleMs = 280
+): Promise<string | null> {
+  const syntaxErr = validateCodeSyntax(rawInputCode);
+  if (syntaxErr !== null) {
+    return `Syntax Error: ${syntaxErr}`;
+  }
+
+  if (typeof window === 'undefined' || typeof document === 'undefined' || !document.body) {
+    return null;
+  }
+
+  const probeId = `probe_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  let bundle: CompilationResult;
+  try {
+    bundle = await compilePreviewBundle(rawInputCode, probeId);
+  } catch (err: any) {
+    return `Compile Error: ${err?.message || String(err)}`;
+  }
+
+  if (bundle.compileError) {
+    return bundle.compileError;
+  }
+
+  if (bundle.usesLucide) {
+    const runtime = (window as any).__AETHER_SANDBOX_RUNTIME__;
+    if (runtime && !runtime.LucideIcons) {
+      try {
+        const lucideMod = await import('lucide-react');
+        runtime.LucideIcons = lucideMod;
+      } catch {}
+    }
+  }
+
+  return new Promise<string | null>(resolve => {
+    let settled = false;
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+    let hardTimeout: ReturnType<typeof setTimeout> | null = null;
+
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+    iframe.setAttribute('aria-hidden', 'true');
+    iframe.style.cssText =
+      'position:fixed;left:-9999px;top:-9999px;width:320px;height:480px;opacity:0;pointer-events:none;border:0;';
+
+    const cleanup = (result: string | null) => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('message', onMessage);
+      if (settleTimer) clearTimeout(settleTimer);
+      if (hardTimeout) clearTimeout(hardTimeout);
+      try {
+        iframe.srcdoc = '';
+        iframe.remove();
+      } catch {}
+      resolve(result);
+    };
+
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data;
+      if (!data || typeof data !== 'object' || data.probeId !== probeId) return;
+      if (data.type === 'AETHER_PROBE_ERROR') {
+        cleanup(typeof data.error === 'string' ? data.error : 'Runtime Error during mount');
+      } else if (data.type === 'AETHER_PROBE_SUCCESS') {
+        // Wait `settleMs` so initial `useEffect` mount hooks & first render pass can still report errors
+        if (!settleTimer) {
+          settleTimer = setTimeout(() => cleanup(null), settleMs);
+        }
+      }
+    };
+
+    window.addEventListener('message', onMessage);
+    hardTimeout = setTimeout(() => cleanup(null), Math.max(900, settleMs + 650));
+
+    iframe.srcdoc = bundle.html;
+    document.body.appendChild(iframe);
+  });
 }

@@ -7,13 +7,19 @@ import { SaveProgramModal } from './components/SaveProgramModal';
 import { ModelSelectorModal, SettingsModalSection } from './components/ModelSelectorModal';
 import { GitHubSyncModal } from './components/GitHubSyncModal';
 
-import { LocalAIModel, KnowledgeDoc } from './types/ai';
+import {
+  LocalAIModel,
+  KnowledgeDoc,
+  AgentInteractionMode,
+  AgentCodingPlan,
+} from './types/ai';
 import { CodeProject, VersionSnapshot } from './types/project';
 import {
   AVAILABLE_MODELS,
   DEFAULT_MODEL_ID,
   DEFAULT_CONTEXT_WINDOW,
   aiEngine,
+  detectAutoAgentIntent,
 } from './services/aiEngine';
 import { nativeBridge, NativeStatusPayload } from './services/nativeBridge';
 import { offlineStorage, DEFAULT_STARTER_CODE } from './services/storage';
@@ -36,8 +42,11 @@ export default function App() {
   // Multi-program workspace state
   const [projects, setProjects] = useState<CodeProject[]>([]);
   const [currentProjectId, setCurrentProjectId] = useState<string>(() => createFreshProjectId());
+  const currentProjectIdRef = useRef<string>(currentProjectId);
   const [projectName, setProjectName] = useState<string>('Untitled Program');
+  const projectNameRef = useRef<string>('Untitled Program');
   const [projectCreatedAt, setProjectCreatedAt] = useState<number>(() => Date.now());
+  const projectCreatedAtRef = useRef<number>(projectCreatedAt);
 
   // Editor, Undo/Redo & Preview state
   const [activeCode, setActiveCode] = useState<string>(DEFAULT_STARTER_CODE);
@@ -56,9 +65,16 @@ export default function App() {
   const [bottomTab, setBottomTab] = useState<BottomAreaTab>('preview');
   const [isPreviewFullScreen, setIsPreviewFullScreen] = useState<boolean>(false);
 
-  // Chat conversation & version history state
+  // Agentic Chat, Mode, Plan & Version History state
+  const [interactionMode, setInteractionMode] = useState<AgentInteractionMode>('auto');
+  const [activePlan, setActivePlan] = useState<AgentCodingPlan | null>(null);
+  const latestPlanRef = useRef<AgentCodingPlan | null>(null);
+  const stopPlanSequenceRef = useRef<boolean>(false);
+
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const latestMessagesRef = useRef<ChatMessage[]>([]);
   const [versions, setVersions] = useState<VersionSnapshot[]>([]);
+  const latestVersionsRef = useRef<VersionSnapshot[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [streamingStatus, setStreamingStatus] = useState('');
   const chatInputRef = useRef<HTMLInputElement>(null);
@@ -83,9 +99,33 @@ export default function App() {
   const [isGitHubOpen, setIsGitHubOpen] = useState(false);
   const [githubToken, setGithubToken] = useState('');
 
+  const updateProjectIdentity = (id: string, name: string, createdAt: number) => {
+    currentProjectIdRef.current = id;
+    projectNameRef.current = name;
+    projectCreatedAtRef.current = createdAt;
+    setCurrentProjectId(id);
+    setProjectName(name);
+    setProjectCreatedAt(createdAt);
+  };
+
   const updateActiveCodeState = (nextCode: string) => {
     latestActiveCodeRef.current = nextCode;
     setActiveCode(nextCode);
+  };
+
+  const updateMessagesState = (nextMsgs: ChatMessage[]) => {
+    latestMessagesRef.current = nextMsgs;
+    setMessages(nextMsgs);
+  };
+
+  const updateVersionsState = (nextVers: VersionSnapshot[]) => {
+    latestVersionsRef.current = nextVers;
+    setVersions(nextVers);
+  };
+
+  const updatePlanState = (nextPlan: AgentCodingPlan | null) => {
+    latestPlanRef.current = nextPlan;
+    setActivePlan(nextPlan);
   };
 
   const updateRunCount = (nextVal: number | ((prev: number) => number)) => {
@@ -147,7 +187,16 @@ export default function App() {
           await offlineStorage.deleteProject(proj.id);
           continue;
         }
-        if (proj.activeCode && proj.activeCode.trim().length > 0) {
+        if ((proj.activeCode && proj.activeCode.trim().length > 0) || proj.activePlan) {
+          // Reset any stale 'in_progress' step left from a closed session back to 'pending'
+          if (proj.activePlan) {
+            proj.activePlan = {
+              ...proj.activePlan,
+              steps: proj.activePlan.steps.map(s =>
+                s.status === 'in_progress' ? { ...s, status: 'pending' } : s
+              ),
+            };
+          }
           validProjects.push(proj);
         }
       }
@@ -157,26 +206,30 @@ export default function App() {
 
       const lastActiveId = await offlineStorage.getSetting<string>('last_active_project_id', '');
       if (lastActiveId === '__blank_new__') {
-        setCurrentProjectId(createFreshProjectId());
-        setProjectName('Untitled Program');
+        const freshId = createFreshProjectId();
+        updateProjectIdentity(freshId, 'Untitled Program', Date.now());
         updateActiveCodeState('');
         setPreviewCode('');
         resetUndoHistory('');
-        setMessages([]);
-        setVersions([]);
+        updateMessagesState([]);
+        updateVersionsState([]);
+        updatePlanState(null);
       } else {
         const target =
           validProjects.find(p => p.id === lastActiveId) || validProjects[0] || null;
 
         if (target) {
-          setCurrentProjectId(target.id);
-          setProjectName(target.name || 'Untitled Program');
-          setProjectCreatedAt(target.createdAt || Date.now());
+          updateProjectIdentity(
+            target.id,
+            target.name || 'Untitled Program',
+            target.createdAt || Date.now()
+          );
           updateActiveCodeState(target.activeCode);
           setPreviewCode(target.activeCode);
           resetUndoHistory(target.activeCode);
-          setVersions(target.versions || []);
-          setMessages(target.messages || []);
+          updateVersionsState(target.versions || []);
+          updateMessagesState(target.messages || []);
+          updatePlanState(target.activePlan || null);
         }
       }
 
@@ -219,18 +272,32 @@ export default function App() {
     });
   };
 
-  const persistCodeChange = async (codeToSave: string) => {
-    if (codeToSave.trim().length === 0) return;
-    const now = Date.now();
+  const persistWorkspaceSnapshot = async (overrides?: {
+    name?: string;
+    code?: string;
+    msgs?: ChatMessage[];
+    vers?: VersionSnapshot[];
+    plan?: AgentCodingPlan | null;
+  }) => {
+    const codeToSave = overrides?.code ?? latestActiveCodeRef.current;
+    const planToSave =
+      overrides?.plan !== undefined ? overrides.plan : latestPlanRef.current;
+    const msgsToSave = overrides?.msgs ?? latestMessagesRef.current;
+    const versToSave = overrides?.vers ?? latestVersionsRef.current;
+    const resolvedName = overrides?.name ?? projectNameRef.current;
+
+    if (!codeToSave.trim() && !planToSave && msgsToSave.length === 0) return;
+
     const record: CodeProject = {
-      id: currentProjectId,
-      name: projectName,
+      id: currentProjectIdRef.current,
+      name: resolvedName,
       description: 'Local AI Program',
-      createdAt: projectCreatedAt,
-      updatedAt: now,
+      createdAt: projectCreatedAtRef.current,
+      updatedAt: Date.now(),
       activeCode: codeToSave,
-      versions,
-      messages: messages.slice(-40),
+      versions: versToSave,
+      messages: msgsToSave.slice(-40),
+      activePlan: planToSave,
       files: { 'src/App.tsx': codeToSave },
     };
     await upsertProjectRecord(record);
@@ -239,30 +306,32 @@ export default function App() {
   const handleNewProgram = async () => {
     const freshId = createFreshProjectId();
     const now = Date.now();
-    setCurrentProjectId(freshId);
-    setProjectName('Untitled Program');
-    setProjectCreatedAt(now);
+    updateProjectIdentity(freshId, 'Untitled Program', now);
     updateActiveCodeState('');
     setPreviewCode('');
     resetUndoHistory('');
     setLastRunError(null);
-    setMessages([]);
-    setVersions([]);
+    updateMessagesState([]);
+    updateVersionsState([]);
+    updatePlanState(null);
     updateRunCount(0);
     setIsPreviewFullScreen(false);
     await offlineStorage.setSetting('last_active_project_id', '__blank_new__');
   };
 
   const handleSelectProject = async (proj: CodeProject) => {
-    setCurrentProjectId(proj.id);
-    setProjectName(proj.name || 'Untitled Program');
-    setProjectCreatedAt(proj.createdAt || Date.now());
+    updateProjectIdentity(
+      proj.id,
+      proj.name || 'Untitled Program',
+      proj.createdAt || Date.now()
+    );
     updateActiveCodeState(proj.activeCode);
     setPreviewCode(proj.activeCode);
     resetUndoHistory(proj.activeCode);
     setLastRunError(null);
-    setVersions(proj.versions || []);
-    setMessages(proj.messages || []);
+    updateVersionsState(proj.versions || []);
+    updateMessagesState(proj.messages || []);
+    updatePlanState(proj.activePlan || null);
     setBottomTab('preview');
     updateRunCount(proj.activeCode.trim() ? 1 : 0);
     await offlineStorage.setSetting('last_active_project_id', proj.id);
@@ -273,7 +342,7 @@ export default function App() {
     const remaining = projects.filter(p => p.id !== projectId);
     setProjects(remaining);
 
-    if (projectId === currentProjectId) {
+    if (projectId === currentProjectIdRef.current) {
       if (remaining.length > 0) {
         await handleSelectProject(remaining[0]);
       } else {
@@ -299,52 +368,31 @@ export default function App() {
       modelUsed: 'Phone Files',
     };
 
-    const record: CodeProject = {
-      id: newId,
-      name: importedName,
-      description: 'Imported from Phone Files',
-      createdAt: now,
-      updatedAt: now,
-      activeCode: code,
-      versions: [snapshot],
-      messages: [],
-      files: { 'src/App.tsx': code },
-    };
-
-    setCurrentProjectId(newId);
-    setProjectName(importedName);
-    setProjectCreatedAt(now);
+    updateProjectIdentity(newId, importedName, now);
     updateActiveCodeState(code);
     setPreviewCode(code);
     resetUndoHistory(code);
     setLastRunError(null);
-    setVersions([snapshot]);
-    setMessages([]);
+    updateVersionsState([snapshot]);
+    updateMessagesState([]);
+    updatePlanState(null);
     setBottomTab('code');
     updateRunCount(0);
 
-    await upsertProjectRecord(record);
+    await persistWorkspaceSnapshot({
+      name: importedName,
+      code,
+      vers: [snapshot],
+      msgs: [],
+      plan: null,
+    });
   };
 
   const handleSaveToLibrary = async (chosenName: string) => {
     const cleanName = chosenName.trim() || 'Untitled Program';
-    const now = Date.now();
+    projectNameRef.current = cleanName;
     setProjectName(cleanName);
-    const currentCode = latestActiveCodeRef.current;
-
-    const record: CodeProject = {
-      id: currentProjectId,
-      name: cleanName,
-      description: 'Local AI Program',
-      createdAt: projectCreatedAt,
-      updatedAt: now,
-      activeCode: currentCode,
-      versions,
-      messages: messages.slice(-40),
-      files: { 'src/App.tsx': currentCode },
-    };
-
-    await upsertProjectRecord(record);
+    await persistWorkspaceSnapshot({ name: cleanName });
   };
 
   const handlePressCodeButton = () => {
@@ -376,7 +424,7 @@ export default function App() {
     setRedoStack(prev => [...prev, currentCode]);
     typingCheckpointRef.current.baseCode = previousCode;
     updateActiveCodeState(previousCode);
-    await persistCodeChange(previousCode);
+    await persistWorkspaceSnapshot({ code: previousCode });
   };
 
   const handleRedo = async () => {
@@ -392,14 +440,227 @@ export default function App() {
     setUndoStack(prev => [...prev.slice(-(MAX_UNDO_STEPS - 1)), currentCode]);
     typingCheckpointRef.current.baseCode = nextCode;
     updateActiveCodeState(nextCode);
-    await persistCodeChange(nextCode);
+    await persistWorkspaceSnapshot({ code: nextCode });
   };
 
   const handleReportRunError = useCallback((err: string | null) => {
     setLastRunError(err);
   }, []);
 
-  const handleSendMessage = async (prompt: string) => {
+  const liveSyntaxError = useMemo(() => {
+    if (!activeCode.trim()) return null;
+    const err = validateCodeSyntax(activeCode);
+    return err ? `Syntax Error: ${err}` : null;
+  }, [activeCode]);
+
+  const effectiveError = liveSyntaxError || lastRunError;
+
+  const isStarterOrEmptyCode = (code: string) =>
+    !code.trim() || code.trim() === DEFAULT_STARTER_CODE.trim();
+
+  /**
+   * Executes either the next pending step (`mode: 'single'`) or all remaining steps (`mode: 'all'`)
+   * from `activePlan`, compiling & runtime-verifying after EVERY step and saving per-step Undo snapshots!
+   */
+  const executePlanSteps = async (mode: 'single' | 'all') => {
+    const initialPlan = latestPlanRef.current;
+    if (!initialPlan || isGenerating) return;
+
+    const firstTarget = initialPlan.steps.find(s => s.status !== 'completed');
+    if (!firstTarget) return;
+
+    stopPlanSequenceRef.current = false;
+    setIsGenerating(true);
+    setStreamingStatus('');
+
+    try {
+      while (!stopPlanSequenceRef.current) {
+        const currentPlan = latestPlanRef.current;
+        if (!currentPlan) break;
+
+        const targetStep = currentPlan.steps.find(s => s.status !== 'completed');
+        if (!targetStep) break;
+
+        // Mark step as in_progress
+        const workingPlan: AgentCodingPlan = {
+          ...currentPlan,
+          updatedAt: Date.now(),
+          steps: currentPlan.steps.map(s =>
+            s.id === targetStep.id
+              ? { ...s, status: 'in_progress', errorNote: undefined }
+              : s
+          ),
+        };
+        updatePlanState(workingPlan);
+
+        const codeBeforeStep = latestActiveCodeRef.current;
+        const completedTitles = workingPlan.steps
+          .filter(s => s.status === 'completed')
+          .map(s => s.title);
+
+        const forceFreshStart = Boolean(
+          workingPlan.isNewAppFromScratch &&
+            targetStep.stepNumber === 1 &&
+            isStarterOrEmptyCode(codeBeforeStep)
+        );
+
+        const docContext = retrieveRelevantDocContext(
+          `${workingPlan.goal} ${targetStep.title} ${targetStep.details}`,
+          knowledgeDocs,
+          1400
+        );
+
+        setStreamingStatus(
+          `Step ${targetStep.stepNumber}/${workingPlan.steps.length}: ${targetStep.title}...`
+        );
+
+        try {
+          const result = await aiEngine.generateCode(
+            {
+              prompt: `Step ${targetStep.stepNumber}: ${targetStep.title} — ${targetStep.details}`,
+              currentCode: forceFreshStart ? '' : codeBeforeStep,
+              modelId: activeModelId,
+              history: latestMessagesRef.current.map(m => ({
+                role: m.role,
+                content: m.content,
+              })),
+              lastRuntimeError: forceFreshStart ? null : effectiveError,
+              docContext,
+              planStepContext: {
+                goal: workingPlan.goal,
+                stepNumber: targetStep.stepNumber,
+                totalSteps: workingPlan.steps.length,
+                stepTitle: targetStep.title,
+                stepDetails: targetStep.details,
+                completedStepTitles: completedTitles,
+                forceFreshStart,
+              },
+            },
+            chunk => {
+              setStreamingStatus(chunk);
+            }
+          );
+
+          const now = Date.now();
+          const stats = calculateChangeStats(
+            forceFreshStart ? '' : codeBeforeStep,
+            result.code
+          );
+          const curVers = latestVersionsRef.current;
+          const newSnapshot: VersionSnapshot = {
+            id: `v_${now}`,
+            versionNumber: curVers.length + 1,
+            versionTag: `v1.${curVers.length}`,
+            timestamp: now,
+            title: result.versionTitle,
+            summary: result.explanation,
+            code: result.code,
+            prompt: `${targetStep.title}: ${targetStep.details}`,
+            modelUsed: result.modelUsed,
+            linesAdded: stats.added,
+            linesRemoved: stats.removed,
+            trigger: 'prompt',
+          };
+
+          const nextVers = [newSnapshot, ...curVers];
+          const nextName =
+            projectNameRef.current === 'Untitled Program'
+              ? workingPlan.goal.slice(0, 38)
+              : projectNameRef.current;
+
+          pushImmediateUndoSnapshot(codeBeforeStep, result.code);
+          projectNameRef.current = nextName;
+          setProjectName(nextName);
+          updateVersionsState(nextVers);
+          updateActiveCodeState(result.code);
+          setLastRunError(null);
+
+          // Automatically compile & show live preview after each verified step!
+          setPreviewCode(result.code);
+          updateRunCount(c => c + 1);
+
+          const completedPlan: AgentCodingPlan = {
+            ...workingPlan,
+            updatedAt: now,
+            steps: workingPlan.steps.map(s =>
+              s.id === targetStep.id
+                ? { ...s, status: 'completed', errorNote: undefined }
+                : s
+            ),
+          };
+          updatePlanState(completedPlan);
+
+          const stepMsg: ChatMessage = {
+            id: `m_${now}_step_${targetStep.stepNumber}`,
+            role: 'assistant',
+            kind: 'build',
+            content: `✓ Step ${targetStep.stepNumber}/${completedPlan.steps.length}: ${targetStep.title} (+${stats.added} / -${stats.removed} lines) · ${
+              result.selfFixedRuntime
+                ? 'Compile + runtime verified (self-fixed 1 runtime issue).'
+                : 'Compile + runtime verified.'
+            }`,
+            timestamp: now,
+          };
+          const nextMsgs = [...latestMessagesRef.current, stepMsg];
+          updateMessagesState(nextMsgs);
+
+          await persistWorkspaceSnapshot({
+            name: nextName,
+            code: result.code,
+            vers: nextVers,
+            msgs: nextMsgs,
+            plan: completedPlan,
+          });
+          await offlineStorage.addSnapshot(newSnapshot);
+        } catch (stepErr: any) {
+          const errText = stepErr?.message || 'Step interrupted.';
+          const failedPlan: AgentCodingPlan = {
+            ...workingPlan,
+            updatedAt: Date.now(),
+            steps: workingPlan.steps.map(s =>
+              s.id === targetStep.id
+                ? { ...s, status: 'failed', errorNote: errText }
+                : s
+            ),
+          };
+          updatePlanState(failedPlan);
+          await persistWorkspaceSnapshot({ plan: failedPlan });
+
+          if (!/Generation stopped/i.test(errText)) {
+            const failMsg: ChatMessage = {
+              id: `m_${Date.now()}_steperr`,
+              role: 'assistant',
+              kind: 'error',
+              content: `Paused on Step ${targetStep.stepNumber} (${targetStep.title}): ${errText}`,
+              timestamp: Date.now(),
+            };
+            const nextMsgs = [...latestMessagesRef.current, failMsg];
+            updateMessagesState(nextMsgs);
+            await persistWorkspaceSnapshot({ msgs: nextMsgs, plan: failedPlan });
+          }
+          break;
+        }
+
+        if (mode === 'single') {
+          break;
+        }
+      }
+    } finally {
+      setIsGenerating(false);
+      setStreamingStatus('');
+    }
+  };
+
+  const handleSendMessage = async (
+    prompt: string,
+    explicitMode?: AgentInteractionMode
+  ) => {
+    const chosenMode = explicitMode ?? interactionMode;
+    const resolvedIntent =
+      chosenMode === 'auto'
+        ? detectAutoAgentIntent(prompt, latestPlanRef.current)
+        : chosenMode;
+
     const userMsg: ChatMessage = {
       id: `m_${Date.now()}_u`,
       role: 'user',
@@ -407,28 +668,111 @@ export default function App() {
       timestamp: Date.now(),
     };
 
-    const nextMessages = [...messages, userMsg];
-    setMessages(nextMessages);
+    const nextMessages = [...latestMessagesRef.current, userMsg];
+    updateMessagesState(nextMessages);
+
+    if (resolvedIntent === 'run_next_step') {
+      await persistWorkspaceSnapshot({ msgs: nextMessages });
+      await executePlanSteps('single');
+      return;
+    }
+
+    if (resolvedIntent === 'run_all_steps') {
+      await persistWorkspaceSnapshot({ msgs: nextMessages });
+      await executePlanSteps('all');
+      return;
+    }
+
     setIsGenerating(true);
     setStreamingStatus('');
-
     const currentCodeSnapshot = latestActiveCodeRef.current;
 
     try {
       const docContext = retrieveRelevantDocContext(prompt, knowledgeDocs, 1400);
-      const currentSyntaxErr = currentCodeSnapshot.trim()
-        ? validateCodeSyntax(currentCodeSnapshot)
-        : null;
-      const activeErrorContext =
-        lastRunError || (currentSyntaxErr ? `Syntax Error: ${currentSyntaxErr}` : null);
+
+      // Mode 1: Conversational Chat / Code Review (Never touches activeCode!)
+      if (resolvedIntent === 'chat') {
+        const chatRes = await aiEngine.chatWithCode(
+          {
+            prompt,
+            currentCode: currentCodeSnapshot,
+            modelId: activeModelId,
+            history: nextMessages.map(m => ({ role: m.role, content: m.content })),
+            lastRuntimeError: effectiveError,
+            docContext,
+          },
+          chunk => {
+            setStreamingStatus(chunk);
+          }
+        );
+
+        const assistantMsg: ChatMessage = {
+          id: `m_${Date.now()}_chat`,
+          role: 'assistant',
+          kind: 'chat',
+          content: chatRes.reply,
+          timestamp: Date.now(),
+        };
+        const finalMessages = [...nextMessages, assistantMsg];
+        updateMessagesState(finalMessages);
+        await persistWorkspaceSnapshot({ msgs: finalMessages });
+        return;
+      }
+
+      // Mode 2: Step-by-Step Architectural Plan Generation
+      if (resolvedIntent === 'plan') {
+        const starterOrBlank = isStarterOrEmptyCode(currentCodeSnapshot);
+        setStreamingStatus('Designing step-by-step implementation plan...');
+        const planRes = await aiEngine.generateCodingPlan(
+          {
+            prompt,
+            currentCode: currentCodeSnapshot,
+            isStarterOrBlankCode: starterOrBlank,
+            modelId: activeModelId,
+            history: nextMessages.map(m => ({ role: m.role, content: m.content })),
+            lastRuntimeError: effectiveError,
+            docContext,
+          },
+          chunk => {
+            setStreamingStatus(chunk);
+          }
+        );
+
+        updatePlanState(planRes.plan);
+        if (interactionMode === 'plan') {
+          setInteractionMode('auto');
+        }
+
+        const planIntroMsg: ChatMessage = {
+          id: `m_${Date.now()}_plan`,
+          role: 'assistant',
+          kind: 'plan',
+          content: `Created a ${planRes.plan.steps.length}-step plan below. Tap "Run Step 1" to review each step as it builds, or "Run All Steps" to execute and verify every step automatically.`,
+          timestamp: Date.now(),
+        };
+        const finalMessages = [...nextMessages, planIntroMsg];
+        updateMessagesState(finalMessages);
+        await persistWorkspaceSnapshot({
+          msgs: finalMessages,
+          plan: planRes.plan,
+        });
+        return;
+      }
+
+      // Mode 3: Direct Build / Surgical Edit + Compile & Runtime Self-Check
+      const starterOnStandaloneApp =
+        currentCodeSnapshot.trim() === DEFAULT_STARTER_CODE.trim() &&
+        /\b(write|create|build|make|generate|implement)\s+(?:me\s+)?(?:a|an)\b/i.test(prompt);
+
+      const effectiveBaseCode = starterOnStandaloneApp ? '' : currentCodeSnapshot;
 
       const result = await aiEngine.generateCode(
         {
           prompt,
-          currentCode: currentCodeSnapshot,
+          currentCode: effectiveBaseCode,
           modelId: activeModelId,
           history: nextMessages.map(m => ({ role: m.role, content: m.content })),
-          lastRuntimeError: activeErrorContext,
+          lastRuntimeError: starterOnStandaloneApp ? null : effectiveError,
           docContext,
         },
         statusChunk => {
@@ -437,12 +781,13 @@ export default function App() {
       );
 
       const now = Date.now();
-      const wasUpdatingExisting = currentCodeSnapshot.trim().length > 0;
-      const stats = calculateChangeStats(currentCodeSnapshot, result.code);
+      const wasUpdatingExisting = effectiveBaseCode.trim().length > 0;
+      const stats = calculateChangeStats(effectiveBaseCode, result.code);
+      const curVers = latestVersionsRef.current;
       const newSnapshot: VersionSnapshot = {
         id: `v_${now}`,
-        versionNumber: versions.length + 1,
-        versionTag: `v1.${versions.length}`,
+        versionNumber: curVers.length + 1,
+        versionTag: `v1.${curVers.length}`,
         timestamp: now,
         title: result.versionTitle,
         summary: result.explanation,
@@ -454,62 +799,59 @@ export default function App() {
         trigger: 'prompt',
       };
 
-      const updatedVersions = [newSnapshot, ...versions];
+      const updatedVersions = [newSnapshot, ...curVers];
       const nextName =
-        projectName === 'Untitled Program' ? result.versionTitle : projectName;
+        projectNameRef.current === 'Untitled Program'
+          ? result.versionTitle
+          : projectNameRef.current;
 
       pushImmediateUndoSnapshot(currentCodeSnapshot, result.code);
+      projectNameRef.current = nextName;
       setProjectName(nextName);
-      setVersions(updatedVersions);
+      updateVersionsState(updatedVersions);
       updateActiveCodeState(result.code);
       setLastRunError(null);
 
-      const autoRefreshedPreview = runCountRef.current > 0;
-      if (autoRefreshedPreview) {
-        setPreviewCode(result.code);
-        updateRunCount(c => c + 1);
-      }
+      setPreviewCode(result.code);
+      updateRunCount(c => c + 1);
 
       const summaryContent = wasUpdatingExisting
         ? `${newSnapshot.versionTag} (+${stats.added} / -${stats.removed} lines) · ${
-            autoRefreshedPreview
-              ? 'Live preview updated automatically (or tap Run anytime to restart).'
-              : result.explanation
+            result.selfFixedRuntime
+              ? 'Live preview updated (compile + runtime verified, auto-fixed 1 runtime issue).'
+              : 'Live preview updated (compile + runtime verified).'
           }`
         : result.explanation;
 
       const assistantMsg: ChatMessage = {
         id: `m_${now}_a`,
         role: 'assistant',
+        kind: 'build',
         content: summaryContent,
         timestamp: now,
       };
 
       const finalMessages = [...nextMessages, assistantMsg];
-      setMessages(finalMessages);
+      updateMessagesState(finalMessages);
 
-      const record: CodeProject = {
-        id: currentProjectId,
+      await persistWorkspaceSnapshot({
         name: nextName,
-        description: 'Local AI Program',
-        createdAt: projectCreatedAt,
-        updatedAt: now,
-        activeCode: result.code,
-        versions: updatedVersions,
-        messages: finalMessages.slice(-40),
-        files: { 'src/App.tsx': result.code },
-      };
-
-      await upsertProjectRecord(record);
+        code: result.code,
+        vers: updatedVersions,
+        msgs: finalMessages,
+      });
       await offlineStorage.addSnapshot(newSnapshot);
     } catch (e: any) {
       const errMsg: ChatMessage = {
         id: `m_${Date.now()}_err`,
         role: 'assistant',
+        kind: 'error',
         content: `Error: ${e?.message || 'Could not run local model.'}`,
         timestamp: Date.now(),
       };
-      setMessages([...nextMessages, errMsg]);
+      const finalMessages = [...nextMessages, errMsg];
+      updateMessagesState(finalMessages);
+      await persistWorkspaceSnapshot({ msgs: finalMessages });
     } finally {
       setIsGenerating(false);
       setStreamingStatus('');
@@ -517,20 +859,29 @@ export default function App() {
   };
 
   const handleStopGeneration = () => {
+    stopPlanSequenceRef.current = true;
     aiEngine.abortActiveGeneration();
   };
 
-  const liveSyntaxError = useMemo(() => {
-    if (!activeCode.trim()) return null;
-    const err = validateCodeSyntax(activeCode);
-    return err ? `Syntax Error: ${err}` : null;
-  }, [activeCode]);
+  const handleTurnLastChatIntoPlan = async (reviewContent: string) => {
+    if (isGenerating) return;
+    await handleSendMessage(
+      `Make a step-by-step plan to implement the key improvements and fixes we just discussed:\n${reviewContent.slice(0, 750)}`,
+      'plan'
+    );
+  };
 
-  const effectiveError = liveSyntaxError || lastRunError;
+  const handleClearPlan = async () => {
+    updatePlanState(null);
+    await persistWorkspaceSnapshot({ plan: null });
+  };
 
   const handleAskAIToFixError = () => {
     if (!effectiveError || isGenerating) return;
-    handleSendMessage(`Please fix this error when running the code: ${effectiveError}`);
+    handleSendMessage(
+      `Please fix this error when running the code: ${effectiveError}`,
+      'build'
+    );
   };
 
   const handleSaveManualCode = async (newCode: string) => {
@@ -549,17 +900,18 @@ export default function App() {
       typingCheckpointRef.current.timer = null;
     }, 650);
 
-    await persistCodeChange(newCode);
+    await persistWorkspaceSnapshot({ code: newCode });
   };
 
   const handleRestoreVersion = async (version: VersionSnapshot) => {
     const now = Date.now();
     const prevCode = latestActiveCodeRef.current;
     const stats = calculateChangeStats(prevCode, version.code);
+    const curVers = latestVersionsRef.current;
     const restoreSnapshot: VersionSnapshot = {
       id: `v_restore_${now}`,
-      versionNumber: versions.length + 1,
-      versionTag: `v1.${versions.length}`,
+      versionNumber: curVers.length + 1,
+      versionTag: `v1.${curVers.length}`,
       timestamp: now,
       title: `Restored ${version.versionTag}`,
       summary: `Reverted to ${version.title}.`,
@@ -571,26 +923,18 @@ export default function App() {
     };
 
     pushImmediateUndoSnapshot(prevCode, version.code);
-    const updatedVersions = [restoreSnapshot, ...versions];
-    setVersions(updatedVersions);
+    const updatedVersions = [restoreSnapshot, ...curVers];
+    updateVersionsState(updatedVersions);
     updateActiveCodeState(version.code);
     setPreviewCode(version.code);
     setLastRunError(null);
     setBottomTab('preview');
     updateRunCount(c => c + 1);
 
-    const record: CodeProject = {
-      id: currentProjectId,
-      name: projectName,
-      description: 'Local AI Program',
-      createdAt: projectCreatedAt,
-      updatedAt: now,
-      activeCode: version.code,
-      versions: updatedVersions,
-      messages: messages.slice(-40),
-      files: { 'src/App.tsx': version.code },
-    };
-    await upsertProjectRecord(record);
+    await persistWorkspaceSnapshot({
+      code: version.code,
+      vers: updatedVersions,
+    });
   };
 
   // Offline Documentation Knowledge Base Handlers
@@ -665,6 +1009,8 @@ export default function App() {
     activeCode.trim().length > 0 && (runCount === 0 || activeCode !== previewCode);
 
   const activeDocsCount = knowledgeDocs.filter(d => d.enabled).length;
+  const hasMeaningfulUserCode =
+    activeCode.trim().length > 0 && activeCode.trim() !== DEFAULT_STARTER_CODE.trim();
 
   return (
     <div className="safe-h-screen w-full bg-zinc-950 text-zinc-100 flex flex-col overflow-hidden font-sans selection:bg-cyan-500/30 selection:text-cyan-200">
@@ -681,7 +1027,7 @@ export default function App() {
         isNativeApp={isNativeApp}
       />
 
-      {/* Split-Screen Body: Top Half = Local AI Chat | Bottom Half = Preview, Undo/Run/Redo & Code Tabs */}
+      {/* Split-Screen Body: Top Half = Agentic AI Chat & Plan | Bottom Half = Preview, Undo/Run/Redo & Code Tabs */}
       <main className="flex-1 min-h-0 flex flex-col overflow-hidden">
         <div className={isPreviewFullScreen ? 'hidden' : 'h-1/2 min-h-0 flex flex-col'}>
           <ChatWorkspace
@@ -690,6 +1036,14 @@ export default function App() {
             activeModelDisplayName={activeModelDisplayName}
             messages={messages}
             activeDocsCount={activeDocsCount}
+            hasActiveCode={hasMeaningfulUserCode || Boolean(activeCode.trim())}
+            interactionMode={interactionMode}
+            onChangeInteractionMode={setInteractionMode}
+            activePlan={activePlan}
+            onRunNextPlanStep={() => executePlanSteps('single')}
+            onRunAllPlanSteps={() => executePlanSteps('all')}
+            onClearPlan={handleClearPlan}
+            onTurnLastChatIntoPlan={handleTurnLastChatIntoPlan}
             onSendMessage={handleSendMessage}
             onStopGeneration={handleStopGeneration}
             onNewProgram={handleNewProgram}
