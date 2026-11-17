@@ -2,6 +2,12 @@ name: Build MiraCode Sideload IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      force_full_native_build:
+        description: 'Force a full native Xcode C++/Pods rebuild even if native files are unchanged'
+        required: false
+        default: false
+        type: boolean
   push:
     branches:
       - main
@@ -11,10 +17,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: sideload-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-sideload-ipa:
     name: Build iOS Sideload IPA
-    runs-on: macos-26
+    runs-on: macos-15-intel
     timeout-minutes: 60
     env:
       NODE_OPTIONS: '--max-old-space-size=8192'
@@ -28,6 +38,12 @@ jobs:
         with:
           node-version: '22.21.0'
           cache: 'yarn'
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-arch-${{ runner.arch }}-node-${{ hashFiles('yarn.lock', 'patches/**') }}
 
       - name: Install Yarn
         run: npm install -g yarn
@@ -108,31 +124,126 @@ jobs:
           </plist>
           EOL
 
+      - name: Fast Hermes JS Bundle Update (when native iOS sources are unchanged)
+        id: fast_repack
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_FULL: ${{ inputs.force_full_native_build }}
+        run: |
+          set -euo pipefail
+          NATIVE_HASH=$(node -e "const cp=require('child_process'),crypto=require('crypto'); const t=cp.execSync('git ls-tree HEAD ios patches package.json yarn.lock',{encoding:'utf8'}).replace(/\r\n/g,'\n').trim(); process.stdout.write(crypto.createHash('sha256').update(t).digest('hex'));")
+          echo "native_hash=$NATIVE_HASH" >> "$GITHUB_OUTPUT"
+          echo "Computed native tree SHA-256: $NATIVE_HASH"
+
+          if [ "${FORCE_FULL:-false}" = "true" ]; then
+            echo "force_full_native_build=true -> running full Xcode build."
+            echo "fast_hit=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          WORK=$(mktemp -d)
+          if ! gh release download "sidestore-latest" --pattern "MiraCode-Sideload.ipa" --dir "$WORK" --clobber; then
+            echo "No existing sidestore-latest MiraCode-Sideload.ipa found -> running full Xcode build."
+            rm -rf "$WORK"
+            echo "fast_hit=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ditto -x -k "$WORK/MiraCode-Sideload.ipa" "$WORK/unpacked"
+          EXTRACTED_APP="$WORK/unpacked/Payload/PocketPal.app"
+          if [ ! -d "$EXTRACTED_APP" ] || [ ! -f "$EXTRACTED_APP/main.jsbundle" ]; then
+            echo "Existing IPA missing Payload/PocketPal.app -> running full Xcode build."
+            rm -rf "$WORK"
+            echo "fast_hit=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Baseline SHA-256 of verified native build 3f98106b when miracode-native-sha.txt was not yet stamped
+          VERIFIED_3F98_NATIVE_HASH="dbf94fcef50d9e13fbb67f347a1eeb44a74ed71f1a7f712c981d2e5d47d4c7ea"
+          if [ -f "$EXTRACTED_APP/miracode-native-sha.txt" ]; then
+            BASE_HASH=$(tr -d '[:space:]' < "$EXTRACTED_APP/miracode-native-sha.txt")
+          else
+            BASE_HASH="$VERIFIED_3F98_NATIVE_HASH"
+          fi
+
+          echo "Base IPA native hash: $BASE_HASH"
+          if [ "$BASE_HASH" != "$NATIVE_HASH" ]; then
+            echo "Native tree changed ($BASE_HASH != $NATIVE_HASH) -> running full Xcode build."
+            rm -rf "$WORK"
+            echo "fast_hit=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Native iOS tree unchanged! Bundling production JS + Hermes bytecode..."
+          NODE_ENV=production BABEL_ENV=production node node_modules/react-native/scripts/bundle.js bundle \
+            --entry-file index.js \
+            --platform ios \
+            --dev false \
+            --minify false \
+            --reset-cache \
+            --bundle-output "$WORK/main.js" \
+            --assets-dest "$EXTRACTED_APP"
+
+          HERMESC="./node_modules/hermes-compiler/hermesc/osx-bin/hermesc"
+          chmod +x "$HERMESC"
+          "$HERMESC" -emit-binary -max-diagnostic-width=80 -O -w -out "$WORK/main.jsbundle" "$WORK/main.js"
+
+          if ! node -e "
+            const fs = require('fs');
+            const oldB = fs.readFileSync(process.argv[1]);
+            const newB = fs.readFileSync(process.argv[2]);
+            const oldVer = oldB.readUInt32LE(8);
+            const newVer = newB.readUInt32LE(8);
+            console.log('Hermes HBC version check: existing=' + oldVer + ', compiled=' + newVer);
+            if (oldVer !== newVer) process.exit(1);
+          " "$EXTRACTED_APP/main.jsbundle" "$WORK/main.jsbundle"; then
+            echo "Hermes HBC bytecode version mismatch -> falling back to full Xcode build."
+            rm -rf "$WORK"
+            echo "fast_hit=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          cp "$WORK/main.jsbundle" "$EXTRACTED_APP/main.jsbundle"
+          printf '%s\n' "$NATIVE_HASH" > "$EXTRACTED_APP/miracode-native-sha.txt"
+
+          DEST_DIR="ios/build/Build/Products/Release-iphoneos"
+          rm -rf "$DEST_DIR/PocketPal.app"
+          mkdir -p "$DEST_DIR"
+          cp -R "$EXTRACTED_APP" "$DEST_DIR/PocketPal.app"
+          rm -rf "$WORK"
+          echo "Fast Hermes bundle update staged at $DEST_DIR/PocketPal.app"
+          echo "fast_hit=true" >> "$GITHUB_OUTPUT"
+
       - name: Cache CocoaPods
+        if: steps.fast_repack.outputs.fast_hit != 'true'
         uses: actions/cache@v4
         with:
           path: |
             ios/Pods
             ~/Library/Caches/CocoaPods
-          key: ${{ runner.os }}-pods-${{ hashFiles('ios/Podfile.lock') }}
+          key: ${{ runner.os }}-arch-${{ runner.arch }}-pods-${{ hashFiles('ios/Podfile.lock') }}
           restore-keys: |
-            ${{ runner.os }}-pods-
+            ${{ runner.os }}-arch-${{ runner.arch }}-pods-
 
       - name: Install CocoaPods dependencies
+        if: steps.fast_repack.outputs.fast_hit != 'true'
         run: |
           cd ios
           pod install
           cd ..
 
       - name: Select default Xcode
+        if: steps.fast_repack.outputs.fast_hit != 'true'
         run: |
           sudo xcode-select -s /Applications/Xcode.app
           xcodebuild -version
 
       - name: Ensure Metal toolchain
+        if: steps.fast_repack.outputs.fast_hit != 'true'
         run: xcrun -sdk iphoneos metal -v || xcodebuild -downloadComponent MetalToolchain
 
       - name: Build iOS Release (.app)
+        if: steps.fast_repack.outputs.fast_hit != 'true'
         run: |
           cd ios
           xcodebuild \
@@ -153,6 +264,7 @@ jobs:
             grep -B 5 -A 20 "error:" ../ios-build.log | tail -200 || tail -100 ../ios-build.log
             exit $EXIT_CODE
           fi
+          printf '%s\n' "${{ steps.fast_repack.outputs.native_hash }}" > build/Build/Products/Release-iphoneos/PocketPal.app/miracode-native-sha.txt
 
       - name: Verify Metal & llama.rn payload
         run: bash scripts/verify-ios-payload.sh ios/build/Build/Products/Release-iphoneos/PocketPal.app --require-marker
@@ -183,7 +295,10 @@ jobs:
           - **MiraCode-Sideload-IPA.zip** — Zipped archive ready to save directly to iPhone **Files**
           - **MiraCode-Sideload.ipa** — Direct SideStore .ipa (tap + in SideStore and select file, no unzipping needed)
 
-          Includes Extended RAM entitlements, 8192-token Metal context window, surgical SEARCH/REPLACE code patching, and deterministic syntax auto-healer.
+          ### What's New
+          - **Agentic Coding Workflow (`Auto` · `Chat` · `Plan` · `Build`):** Ask questions, review code with line references without overwriting your file, generate a 3–5 step implementation plan, and execute steps one-by-one (`Run Step k`) or automatically (`Run All Steps`) with focused context per step.
+          - **Compile + Headless Runtime Self-Verification:** Automatically mounts every generated step in an isolated offscreen sandbox to catch both compile errors and immediate runtime crashes (`ReferenceError`, `TypeError`, empty render) and self-repairs before completing the step.
+          - **Extended RAM + 8192-Token Metal Context + Surgical Patching:** Preserves Extended RAM entitlements, 8192-token Apple Metal context window, fuzzy `SEARCH/REPLACE` patching, and deterministic syntax auto-healing.
           NOTES_EOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -202,4 +317,3 @@ jobs:
           - **Direct .ipa Download (SideStore):** [MiraCode-Sideload.ipa](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/MiraCode-Sideload.ipa)
           - **Releases Page:** https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}
           EOF
-
